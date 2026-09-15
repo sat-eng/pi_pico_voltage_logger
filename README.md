@@ -342,9 +342,7 @@ When measuring vehicle electrical systems:
 
 ## License
 
-No license is included by this README. Add a `LICENSE` file before
-publishing if you want to define how others may use, modify and
-redistribute the project.
+This project is licensed under the MIT License.
 
-For a permissive open-source project where attribution/copyright notices
-must be retained, the **MIT License** is a common choice.
+Copyright © 2026 Satish Kunapuli.
+See the [LICENSE](LICENSE) file for details.
