@@ -1,0 +1,1352 @@
+import network
+import socket
+import struct
+import time
+import os
+import gc
+import machine
+
+from machine import ADC, RTC
+from config_manager import load as load_config, save as save_config, defaults as default_config, validate as validate_config
+
+
+# ============================================================
+# Configuration
+# ============================================================
+
+CONFIG = load_config()
+
+WIFI_SSID = CONFIG["wifi_ssid"]
+WIFI_PASSWORD = CONFIG["wifi_password"]
+NTP_SERVER = CONFIG["ntp_server"]
+
+ADC_PIN = 26
+
+# Bench calibration remains firmware-specific rather than user configuration.
+CAL_SLOPE = 0.00050893
+CAL_OFFSET = -0.13633
+
+SAMPLE_INTERVAL_MS = CONFIG["sample_interval_ms"]
+RECORD_INTERVAL_MS = CONFIG["record_interval_ms"]
+RECORD_SECONDS = RECORD_INTERVAL_MS // 1000
+HISTORY_SECONDS = CONFIG["history_seconds"]
+MAX_RECORDS = HISTORY_SECONDS // RECORD_SECONDS
+
+HTTP_PORT = CONFIG["http_port"]
+NTP_RESYNC_SECONDS = CONFIG["ntp_resync_seconds"]
+
+EVENT_LOW_VOLTAGE = CONFIG["event_low_voltage"]
+EVENT_DROP_VOLTS = CONFIG["event_drop_volts"]
+MAX_EVENTS = CONFIG["max_events"]
+MAX_TABLE_ROWS = CONFIG["max_table_rows"]
+MAX_GRAPH_POINTS = CONFIG["max_graph_points"]
+
+DATA_FILE = "voltage.bin"
+
+# Fixed record: Unix timestamp, avg/min/max millivolts, sample count.
+RECORD_FORMAT = "<IHHHH"
+RECORD_SIZE = 12
+FILE_SIZE = MAX_RECORDS * RECORD_SIZE
+
+# ============================================================
+# Global state -- deliberately small and bounded
+# ============================================================
+
+adc = ADC(ADC_PIN)
+rtc = RTC()
+wlan = None
+server = None
+ble_console = None
+
+clock_valid = False
+last_ntp_sync_unix = 0
+
+sum_raw = 0
+sample_count = 0
+min_raw = 65535
+max_raw = 0
+last_sample_ticks = 0
+last_record_ticks = 0
+
+latest_epoch = 0
+latest_avg_mv = 0
+latest_min_mv = 0
+latest_max_mv = 0
+latest_sample_count = 0
+
+# ============================================================
+# Time
+# ============================================================
+
+NTP_DELTA_1970 = 2208988800
+UNIX_TO_2000 = 946684800
+PORT_EPOCH_YEAR = time.gmtime(0)[0]
+
+
+def port_to_unix(t):
+    if PORT_EPOCH_YEAR == 2000:
+        return int(t) + UNIX_TO_2000
+    return int(t)
+
+
+def unix_to_port(t):
+    if PORT_EPOCH_YEAR == 2000:
+        return int(t) - UNIX_TO_2000
+    return int(t)
+
+
+def now_unix():
+    return port_to_unix(time.time())
+
+
+def is_leap_year(year):
+    return year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)
+
+
+def days_in_month(year, month):
+    d = (31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31)
+    if month == 2 and is_leap_year(year):
+        return 29
+    return d[month - 1]
+
+
+def weekday(year, month, day):
+    # Monday=0 ... Sunday=6
+    if month < 3:
+        month += 12
+        year -= 1
+    k = year % 100
+    j = year // 100
+    h = (day + (13 * (month + 1)) // 5 + k + k // 4 +
+         j // 4 + 5 * j) % 7
+    return (h + 5) % 7
+
+
+def last_sunday(year, month):
+    day = days_in_month(year, month)
+    return day - ((weekday(year, month, day) - 6) % 7)
+
+
+def uk_offset_seconds(unix_epoch):
+    # Determine UK BST from UTC calendar time.
+    g = time.gmtime(unix_to_port(unix_epoch))
+    year, month, day, hour = g[0], g[1], g[2], g[3]
+
+    if month < 3 or month > 10:
+        return 0
+    if 3 < month < 10:
+        return 3600
+
+    last = last_sunday(year, month)
+
+    if month == 3:
+        if day > last or (day == last and hour >= 1):
+            return 3600
+        return 0
+
+    # October: BST ends at 01:00 UTC on the last Sunday.
+    if day < last or (day == last and hour < 1):
+        return 3600
+    return 0
+
+
+def local_tuple(unix_epoch):
+    return time.gmtime(
+        unix_to_port(unix_epoch + uk_offset_seconds(unix_epoch))
+    )
+
+
+def format_datetime(unix_epoch):
+    if not unix_epoch:
+        return "--"
+    t = local_tuple(unix_epoch)
+    return "{:02d}/{:02d}/{:04d} {:02d}:{:02d}:{:02d}".format(
+        t[2], t[1], t[0], t[3], t[4], t[5]
+    )
+
+
+def format_time(unix_epoch):
+    if not unix_epoch:
+        return "--"
+    t = local_tuple(unix_epoch)
+    return "{:02d}:{:02d}:{:02d}".format(t[3], t[4], t[5])
+
+
+def sync_ntp():
+    global clock_valid, last_ntp_sync_unix
+
+    print("Synchronising NTP with", NTP_SERVER)
+
+    addr = socket.getaddrinfo(NTP_SERVER, 123)[0][-1]
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+    try:
+        s.settimeout(3)
+        request = bytearray(48)
+        request[0] = 0x1B
+        s.sendto(request, addr)
+        response = s.recv(48)
+
+        if len(response) < 48:
+            raise OSError("short NTP response")
+
+        ntp_seconds = struct.unpack("!I", response[40:44])[0]
+        unix_seconds = ntp_seconds - NTP_DELTA_1970
+
+        # Convert the Unix timestamp to calendar fields using the port's
+        # own epoch convention, then set the RTC directly.
+        g = time.gmtime(unix_to_port(unix_seconds))
+        rtc.datetime((
+            g[0], g[1], g[2],
+            weekday(g[0], g[1], g[2]),
+            g[3], g[4], g[5], 0
+        ))
+
+        clock_valid = True
+        last_ntp_sync_unix = unix_seconds
+        print("NTP OK:", format_datetime(unix_seconds),
+              "UK local; port epoch", PORT_EPOCH_YEAR)
+        return True
+
+    except Exception as e:
+        print("NTP error:", e)
+        return False
+
+    finally:
+        s.close()
+
+
+# ============================================================
+# ADC sampling
+# ============================================================
+
+def raw_to_mv(raw):
+    v = raw * CAL_SLOPE + CAL_OFFSET
+    if v < 0:
+        v = 0.0
+    mv = int(v * 1000.0 + 0.5)
+    if mv > 65535:
+        mv = 65535
+    return mv
+
+
+def sample_if_due():
+    global sum_raw, sample_count, min_raw, max_raw, last_sample_ticks
+
+    now = time.ticks_ms()
+
+    if time.ticks_diff(now, last_sample_ticks) < SAMPLE_INTERVAL_MS:
+        return
+
+    # We intentionally take one real sample "now" rather than performing
+    # artificial catch-up samples after a blocking operation.
+    last_sample_ticks = now
+    raw = adc.read_u16()
+
+    sum_raw += raw
+    sample_count += 1
+
+    if raw < min_raw:
+        min_raw = raw
+    if raw > max_raw:
+        max_raw = raw
+
+
+def service_sampling():
+    # Called from file/HTTP loops so long requests continue sampling as
+    # often as practical.
+    sample_if_due()
+
+
+# ============================================================
+# Fixed binary 24-hour ring
+# ============================================================
+
+def ensure_data_file():
+    try:
+        size = os.stat(DATA_FILE)[6]
+    except:
+        size = -1
+
+    if size == FILE_SIZE:
+        return
+
+    print("Creating binary history file:", FILE_SIZE, "bytes")
+    with open(DATA_FILE, "wb") as f:
+        zero = bytes(256)
+        remaining = FILE_SIZE
+        while remaining > 0:
+            n = min(remaining, len(zero))
+            f.write(zero[:n])
+            remaining -= n
+            service_sampling()
+
+    gc.collect()
+
+
+def slot_for_epoch(epoch):
+    return (epoch // RECORD_SECONDS) % MAX_RECORDS
+
+
+def write_record(epoch, avg_mv, minimum_mv, maximum_mv, count):
+    slot = slot_for_epoch(epoch)
+    packed = struct.pack(
+        RECORD_FORMAT,
+        int(epoch),
+        int(avg_mv),
+        int(minimum_mv),
+        int(maximum_mv),
+        min(int(count), 65535)
+    )
+
+    with open(DATA_FILE, "r+b") as f:
+        f.seek(slot * RECORD_SIZE)
+        f.write(packed)
+
+
+def read_slot(f, slot):
+    f.seek(slot * RECORD_SIZE)
+    b = f.read(RECORD_SIZE)
+    if len(b) != RECORD_SIZE:
+        return None
+    r = struct.unpack(RECORD_FORMAT, b)
+    if r[0] == 0:
+        return None
+    return r
+
+
+def read_epoch(f, epoch):
+    r = read_slot(f, slot_for_epoch(epoch))
+    if r and abs(int(r[0]) - int(epoch)) <= RECORD_SECONDS:
+        return r
+    return None
+
+
+def find_latest_record():
+    global latest_epoch, latest_avg_mv, latest_min_mv
+    global latest_max_mv, latest_sample_count
+
+    if not clock_valid:
+        return
+
+    now = now_unix()
+    oldest = now - HISTORY_SECONDS
+
+    best = None
+
+    with open(DATA_FILE, "rb") as f:
+        for slot in range(MAX_RECORDS):
+            r = read_slot(f, slot)
+            if r and oldest <= r[0] <= now + RECORD_SECONDS:
+                if best is None or r[0] > best[0]:
+                    best = r
+            if (slot & 63) == 0:
+                service_sampling()
+
+    if best:
+        latest_epoch = best[0]
+        latest_avg_mv = best[1]
+        latest_min_mv = best[2]
+        latest_max_mv = best[3]
+        latest_sample_count = best[4]
+
+
+def record_interval():
+    global sum_raw, sample_count, min_raw, max_raw
+    global latest_epoch, latest_avg_mv, latest_min_mv
+    global latest_max_mv, latest_sample_count
+
+    if sample_count == 0:
+        return
+
+    avg_raw = sum_raw // sample_count
+
+    avg_mv = raw_to_mv(avg_raw)
+    minimum_mv = raw_to_mv(min_raw)
+    maximum_mv = raw_to_mv(max_raw)
+    count = sample_count
+
+    if clock_valid:
+        epoch = now_unix()
+        # Align storage timestamps to 10-second boundaries.
+        epoch -= epoch % RECORD_SECONDS
+        write_record(epoch, avg_mv, minimum_mv, maximum_mv, count)
+
+        latest_epoch = epoch
+        latest_avg_mv = avg_mv
+        latest_min_mv = minimum_mv
+        latest_max_mv = maximum_mv
+        latest_sample_count = count
+
+        print("{} AVG={:.3f} MIN={:.3f} MAX={:.3f} SAMPLES={}".format(
+            format_datetime(epoch),
+            avg_mv / 1000.0,
+            minimum_mv / 1000.0,
+            maximum_mv / 1000.0,
+            count
+        ))
+    else:
+        print("Clock invalid; interval not stored. AVG={:.3f}".format(
+            avg_mv / 1000.0
+        ))
+
+    sum_raw = 0
+    sample_count = 0
+    min_raw = 65535
+    max_raw = 0
+
+
+def clear_history():
+    global latest_epoch, latest_avg_mv, latest_min_mv
+    global latest_max_mv, latest_sample_count
+
+    with open(DATA_FILE, "r+b") as f:
+        zero = bytes(256)
+        f.seek(0)
+        remaining = FILE_SIZE
+        while remaining > 0:
+            n = min(remaining, len(zero))
+            f.write(zero[:n])
+            remaining -= n
+            service_sampling()
+
+    latest_epoch = 0
+    latest_avg_mv = 0
+    latest_min_mv = 0
+    latest_max_mv = 0
+    latest_sample_count = 0
+    gc.collect()
+
+
+# ============================================================
+# BLE configuration console
+# ============================================================
+
+def _config_value_text(key, value):
+    if key == "wifi_password":
+        return "********" if value else ""
+    return str(value)
+
+
+def _parse_config_value(key, text):
+    current = CONFIG[key]
+    if isinstance(current, bool):
+        v = text.strip().lower()
+        if v in ("1", "true", "yes", "on"):
+            return True
+        if v in ("0", "false", "no", "off"):
+            return False
+        raise ValueError("expected true/false")
+    if isinstance(current, int):
+        return int(text)
+    if isinstance(current, float):
+        return float(text)
+    return text
+
+
+def config_command(line):
+    global CONFIG
+    parts = line.strip().split(None, 2)
+    if not parts:
+        return ""
+    cmd = parts[0].lower()
+
+    if cmd == "help":
+        return ("Commands: help, show, get <key>, set <key> <value>, save, "
+                "status, defaults, clear-data, reboot, apply, apply --clear")
+
+    if cmd == "show":
+        lines = []
+        for key in sorted(CONFIG):
+            lines.append("{} = {}".format(key, _config_value_text(key, CONFIG[key])))
+        return "\r\n".join(lines)
+
+    if cmd == "get":
+        if len(parts) < 2 or parts[1] not in CONFIG:
+            return "ERROR: unknown/missing key"
+        key = parts[1]
+        return "{} = {}".format(key, _config_value_text(key, CONFIG[key]))
+
+    if cmd == "set":
+        if len(parts) < 3 or parts[1] not in CONFIG:
+            return "ERROR: use set <key> <value>"
+        key = parts[1]
+        candidate = {k: v for k, v in CONFIG.items()}
+        candidate[key] = _parse_config_value(key, parts[2])
+        CONFIG = validate_config(candidate)
+        return "OK: {} = {} (not saved)".format(
+            key, _config_value_text(key, CONFIG[key]))
+
+    if cmd == "save":
+        CONFIG = save_config(CONFIG)
+        return "Configuration saved. Use 'reboot' to activate all changes."
+
+    if cmd == "status":
+        ip = "not connected"
+        if wlan and wlan.isconnected():
+            ip = wlan.ifconfig()[0]
+        return ("Wi-Fi: {}\r\nClock: {}\r\nLatest record: {}\r\nFree RAM: {}".format(
+            ip, "valid" if clock_valid else "invalid",
+            format_datetime(latest_epoch), gc.mem_free()))
+
+    if cmd == "defaults":
+        CONFIG = default_config()
+        return "Defaults loaded in memory (not saved). Use 'save' or 'apply'."
+
+    if cmd == "clear-data":
+        clear_history()
+        return "Stored voltage history cleared."
+
+    if cmd == "reboot":
+        if ble_console:
+            ble_console.write("Rebooting...\r\n")
+        time.sleep_ms(250)
+        machine.reset()
+
+    if cmd == "apply" or (cmd == "apply" and len(parts) > 1):
+        do_clear = len(parts) > 1 and parts[1] == "--clear"
+        CONFIG = save_config(CONFIG)
+        if do_clear:
+            clear_history()
+        if ble_console:
+            ble_console.write("Saved{}; rebooting...\r\n".format(
+                " and data cleared" if do_clear else ""))
+        time.sleep_ms(300)
+        machine.reset()
+
+    return "ERROR: unknown command; type 'help'"
+
+
+
+
+def ble_local_echo_enabled():
+    return bool(CONFIG.get("localecho", True))
+
+
+def ble_welcome():
+    ip = "not connected"
+    if wlan and wlan.isconnected():
+        ip = wlan.ifconfig()[0]
+
+    ssid = CONFIG.get("wifi_ssid", "")
+    ntp = CONFIG.get("ntp_server", "")
+    low = CONFIG.get("event_low_voltage", EVENT_LOW_VOLTAGE)
+    drop = CONFIG.get("event_drop_volts", EVENT_DROP_VOLTS)
+
+    return (
+        "Pico Voltage Logger\r\n"
+        "-------------------\r\n"
+        "Wi-Fi SSID : {}\r\n"
+        "Wi-Fi      : {}\r\n"
+        "NTP server : {}\r\n"
+        "Clock      : {}\r\n"
+        "Event low  : {} V\r\n"
+        "Event delta: {} V\r\n"
+        "\r\n"
+        "Quick commands:\r\n"
+        "  status              current logger status\r\n"
+        "  show                show all settings\r\n"
+        "  set wifi_ssid NAME  change Wi-Fi network\r\n"
+        "  set wifi_password P change Wi-Fi password\r\n"
+        "  set ntp_server IP   change NTP server\r\n"
+        "  set localecho false disable command echo\r\n"
+        "  save                save changes\r\n"
+        "  apply               save and reboot\r\n"
+        "  help                all commands"
+    ).format(
+        ssid if ssid else "(not set)",
+        ip,
+        ntp,
+        "valid" if clock_valid else "invalid",
+        low,
+        drop
+    )
+
+
+def start_ble_console():
+    global ble_console
+    if not CONFIG.get("ble_enabled", True):
+        print("BLE console disabled in config")
+        return
+    try:
+        from ble_console import BLEConsole
+        ble_console = BLEConsole(
+            CONFIG.get("device_name", "Pico-Voltage-Logger"),
+            config_command,
+            ble_welcome,
+            ble_local_echo_enabled
+        )
+    except Exception as e:
+        ble_console = None
+        print("BLE console unavailable:", e)
+
+
+def service_ble():
+    if ble_console:
+        ble_console.poll()
+
+
+# ============================================================
+# Wi-Fi
+# ============================================================
+
+def connect_wifi():
+    global wlan
+
+    wlan = network.WLAN(network.STA_IF)
+    wlan.active(True)
+
+    if wlan.isconnected():
+        print("Wi-Fi:", wlan.ifconfig()[0])
+        return True
+
+    print("Connecting Wi-Fi...")
+    wlan.connect(WIFI_SSID, WIFI_PASSWORD)
+
+    start = time.ticks_ms()
+
+    while not wlan.isconnected():
+        service_sampling()
+
+        if time.ticks_diff(time.ticks_ms(), start) > 20000:
+            print("Wi-Fi connection timed out")
+            return False
+
+        time.sleep_ms(20)
+
+    print("Wi-Fi connected:", wlan.ifconfig()[0])
+    return True
+
+
+# ============================================================
+# HTTP helpers -- all output is sent in small chunks
+# ============================================================
+
+def send_all(client, data):
+    if isinstance(data, str):
+        data = data.encode()
+
+    view = memoryview(data)
+    sent = 0
+
+    while sent < len(data):
+        n = client.send(view[sent:])
+        if not n:
+            raise OSError("socket closed")
+        sent += n
+        service_sampling()
+
+
+def send_headers(client, content_type="application/json",
+                 status="200 OK", cache=False):
+    send_all(client, "HTTP/1.1 {}\r\n".format(status))
+    send_all(client, "Content-Type: {}\r\n".format(content_type))
+    send_all(client, "Connection: close\r\n")
+    if not cache:
+        send_all(client, "Cache-Control: no-store\r\n")
+    send_all(client, "\r\n")
+
+
+def json_string(s):
+    # Strings generated here contain only timestamps/reasons, but keep
+    # this safe for JSON without importing/building json.dumps objects.
+    return '"' + str(s).replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def query_value(query, key, default=None):
+    if not query:
+        return default
+    for part in query.split("&"):
+        pieces = part.split("=", 1)
+        if len(pieces) == 2 and pieces[0] == key:
+            return pieces[1]
+    return default
+
+
+# ============================================================
+# Streaming API
+# ============================================================
+
+ALLOWED_WINDOWS = (600, 1800, 3600, 10800, 21600, 43200, 86400)
+
+
+def stream_graph(client, window_seconds, end_epoch):
+    if latest_epoch == 0:
+        send_all(client, "[]")
+        return
+
+    newest = latest_epoch
+    oldest_allowed = max(newest - HISTORY_SECONDS + RECORD_SECONDS, 0)
+
+    if not end_epoch:
+        end_epoch = newest
+
+    if end_epoch > newest:
+        end_epoch = newest
+    if end_epoch < oldest_allowed:
+        end_epoch = oldest_allowed
+
+    start_epoch = max(oldest_allowed, end_epoch - window_seconds)
+
+    # Number of raw 10-second intervals per graph bucket.
+    raw_points = max(1, (end_epoch - start_epoch) // RECORD_SECONDS + 1)
+    stride = max(1, (raw_points + MAX_GRAPH_POINTS - 1) // MAX_GRAPH_POINTS)
+
+    first = True
+
+    send_all(client, "[")
+
+    with open(DATA_FILE, "rb") as f:
+        bucket_start = start_epoch - (start_epoch % RECORD_SECONDS)
+        t = bucket_start
+
+        while t <= end_epoch:
+            b_count = 0
+            b_sum = 0
+            b_min = 65535
+            b_max = 0
+            b_epoch = 0
+
+            for _ in range(stride):
+                if t > end_epoch:
+                    break
+
+                r = read_epoch(f, t)
+
+                if r and start_epoch <= r[0] <= end_epoch:
+                    b_count += 1
+                    b_sum += r[1]
+                    if r[2] < b_min:
+                        b_min = r[2]
+                    if r[3] > b_max:
+                        b_max = r[3]
+                    if not b_epoch:
+                        b_epoch = r[0]
+
+                t += RECORD_SECONDS
+                service_sampling()
+
+            if b_count:
+                avg = b_sum // b_count
+
+                if not first:
+                    send_all(client, ",")
+                first = False
+
+                send_all(client,
+                    '{{"epoch":{},"time":{},"avg":{:.3f},'
+                    '"min":{:.3f},"max":{:.3f}}}'.format(
+                        b_epoch,
+                        json_string(format_time(b_epoch)),
+                        avg / 1000.0,
+                        b_min / 1000.0,
+                        b_max / 1000.0
+                    )
+                )
+
+    send_all(client, "]")
+
+
+def stream_table(client, center_epoch):
+    if latest_epoch == 0:
+        send_all(client, "[]")
+        return
+
+    if center_epoch:
+        start = center_epoch - (MAX_TABLE_ROWS // 2) * RECORD_SECONDS
+    else:
+        start = latest_epoch - (MAX_TABLE_ROWS - 1) * RECORD_SECONDS
+
+    first = True
+    send_all(client, "[")
+
+    with open(DATA_FILE, "rb") as f:
+        # Newest first, matching the previous UI.
+        for i in range(MAX_TABLE_ROWS - 1, -1, -1):
+            epoch = start + i * RECORD_SECONDS
+            r = read_epoch(f, epoch)
+
+            if r:
+                if not first:
+                    send_all(client, ",")
+                first = False
+
+                send_all(client,
+                    '{{"epoch":{},"time":{},"avg":{:.3f},'
+                    '"min":{:.3f},"max":{:.3f},"samples":{}}}'.format(
+                        r[0],
+                        json_string(format_datetime(r[0])),
+                        r[1] / 1000.0,
+                        r[2] / 1000.0,
+                        r[3] / 1000.0,
+                        r[4]
+                    )
+                )
+
+            service_sampling()
+
+    send_all(client, "]")
+
+
+def is_event(r):
+    if not r:
+        return False
+    return (r[2] < int(EVENT_LOW_VOLTAGE * 1000) or
+            (r[3] - r[2]) >= int(EVENT_DROP_VOLTS * 1000))
+
+
+def stream_events(client):
+    first = True
+    count = 0
+    send_all(client, "[")
+
+    if latest_epoch:
+        with open(DATA_FILE, "rb") as f:
+            epoch = latest_epoch
+
+            # Scan newest backwards and stop after MAX_EVENTS.
+            for _ in range(MAX_RECORDS):
+                if count >= MAX_EVENTS:
+                    break
+
+                r = read_epoch(f, epoch)
+
+                if is_event(r):
+                    reason = ""
+
+                    if r[2] < int(EVENT_LOW_VOLTAGE * 1000):
+                        reason = "Low {:.3f} V".format(r[2] / 1000.0)
+
+                    excursion = r[3] - r[2]
+
+                    if excursion >= int(EVENT_DROP_VOLTS * 1000):
+                        if reason:
+                            reason += " / "
+                        reason += "Excursion {:.3f} V".format(
+                            excursion / 1000.0
+                        )
+
+                    if not first:
+                        send_all(client, ",")
+                    first = False
+
+                    send_all(client,
+                        '{{"epoch":{},"time":{},"avg":{:.3f},'
+                        '"min":{:.3f},"max":{:.3f},"reason":{}}}'.format(
+                            r[0],
+                            json_string(format_datetime(r[0])),
+                            r[1] / 1000.0,
+                            r[2] / 1000.0,
+                            r[3] / 1000.0,
+                            json_string(reason)
+                        )
+                    )
+                    count += 1
+
+                epoch -= RECORD_SECONDS
+                service_sampling()
+
+    send_all(client, "]")
+
+
+def stream_api(client, query):
+    try:
+        window = int(query_value(query, "window", "3600"))
+    except:
+        window = 3600
+
+    if window not in ALLOWED_WINDOWS:
+        window = 3600
+
+    try:
+        end_epoch = int(query_value(query, "end", "0"))
+    except:
+        end_epoch = 0
+
+    try:
+        table_center = int(query_value(query, "table_center", "0"))
+    except:
+        table_center = 0
+
+    send_headers(client)
+
+    now = now_unix() if clock_valid else 0
+
+    send_all(client, "{")
+    send_all(client, '"now_epoch":{},'.format(now))
+    send_all(client, '"now_text":{},'.format(
+        json_string(format_datetime(now)) if now else '""'
+    ))
+    send_all(client, '"clock_valid":{},'.format(
+        "true" if clock_valid else "false"
+    ))
+    send_all(client, '"latest_epoch":{},'.format(latest_epoch))
+    send_all(client, '"latest_avg":{:.3f},'.format(latest_avg_mv / 1000.0))
+    send_all(client, '"latest_min":{:.3f},'.format(latest_min_mv / 1000.0))
+    send_all(client, '"latest_max":{:.3f},'.format(latest_max_mv / 1000.0))
+    send_all(client, '"latest_samples":{},'.format(latest_sample_count))
+    send_all(client, '"event_low_voltage":{:.3f},'.format(EVENT_LOW_VOLTAGE))
+    send_all(client, '"event_drop_volts":{:.3f},'.format(EVENT_DROP_VOLTS))
+
+    # Return text range labels from the Pico. JavaScript therefore never
+    # has to interpret the RP2040/MicroPython epoch convention.
+    actual_end = end_epoch if end_epoch else latest_epoch
+    if actual_end > latest_epoch:
+        actual_end = latest_epoch
+    actual_start = max(0, actual_end - window)
+
+    send_all(client, '"range_start_text":{},'.format(
+        json_string(format_datetime(actual_start))
+    ))
+    send_all(client, '"range_end_text":{},'.format(
+        json_string(format_datetime(actual_end))
+    ))
+
+    send_all(client, '"graph":')
+    stream_graph(client, window, end_epoch)
+
+    send_all(client, ',"table":')
+    stream_table(client, table_center)
+
+    send_all(client, ',"events":')
+    stream_events(client)
+
+    send_all(client, "}")
+
+
+# ============================================================
+# Web page
+# ============================================================
+
+HTML = r'''<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Pico Voltage Logger</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<style>
+body{font-family:Arial,sans-serif;margin:18px;background:#f5f5f5;color:#222}
+.card{background:white;padding:16px;margin-bottom:16px;border-radius:8px}
+h1,h2{margin-top:0}
+.metrics{display:flex;gap:24px;flex-wrap:wrap}
+.metric b{font-size:1.4em}
+button{padding:7px 10px;margin:2px;cursor:pointer}
+button.active{font-weight:bold;border:2px solid #333}
+#chartWrap{height:360px}
+.table-scroll{max-height:360px;overflow-y:auto;border:1px solid #ddd}
+table{width:100%;border-collapse:collapse}
+th,td{padding:6px;border-bottom:1px solid #ddd;text-align:right}
+th:first-child,td:first-child{text-align:left}
+thead th{position:sticky;top:0;background:white;z-index:1}
+.measurement-selected{background:#fff2a8}
+.event-list{max-height:240px;overflow-y:auto;border:1px solid #ddd}
+.event-row{padding:8px;border-bottom:1px solid #ddd;cursor:pointer}
+.event-row:hover{background:#f0f0f0}
+.small{font-size:.9em;color:#555}
+</style>
+</head>
+<body>
+<h1>Pico Voltage Logger</h1>
+
+<div class="card">
+  <div><b>Time:</b> <span id="now">--</span></div>
+  <div><b>Status:</b> <span id="status">Starting...</span></div>
+  <div class="metrics">
+    <div class="metric">Average<br><b id="avg">--</b> V</div>
+    <div class="metric">Minimum<br><b id="min">--</b> V</div>
+    <div class="metric">Maximum<br><b id="max">--</b> V</div>
+    <div class="metric">Samples/10s<br><b id="samples">--</b></div>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Detected events</h2>
+  <div class="small">
+    Event: minimum &lt; <span id="lowThreshold">--</span> V or
+    10-second excursion &ge; <span id="dropThreshold">--</span> V.
+    Click an event to centre it in the graph and table.
+  </div>
+  <div id="events" class="event-list">No events detected.</div>
+</div>
+
+<div class="card">
+  <h2>Voltage history</h2>
+  <div>
+    <button data-window="600">10 min</button>
+    <button data-window="1800">30 min</button>
+    <button data-window="3600">1 hour</button>
+    <button data-window="10800">3 hours</button>
+    <button data-window="21600">6 hours</button>
+    <button data-window="43200">12 hours</button>
+    <button data-window="86400">Full</button>
+    <button onclick="back()">Back</button>
+    <button onclick="forward()">Forward</button>
+    <button onclick="goNow()">Now</button>
+  </div>
+  <div id="range" class="small"></div>
+  <div id="chartWrap"><canvas id="chart"></canvas></div>
+  <div class="small">
+    Click anywhere near a graph point to centre the table on that time.
+  </div>
+</div>
+
+<div class="card">
+  <h2>Measurements</h2>
+  <div id="tableScroll" class="table-scroll">
+    <table>
+      <thead>
+        <tr><th>Time</th><th>Average</th><th>Minimum</th>
+            <th>Maximum</th><th>Samples</th></tr>
+      </thead>
+      <tbody id="measurementTable"></tbody>
+    </table>
+  </div>
+</div>
+
+<div class="card">
+  <button onclick="clearData()">Clear stored data</button>
+  <span id="action"></span>
+</div>
+
+<script>
+let graphWindow=3600;
+let graphEnd=0;
+let tableCenter=0;
+let selectedEpoch=0;
+let lastData=null;
+
+const ctx=document.getElementById('chart').getContext('2d');
+const voltageChart=new Chart(ctx,{
+  type:'line',
+  data:{labels:[],datasets:[
+    {label:'Average',data:[],pointRadius:0,borderWidth:2},
+    {label:'Minimum',data:[],pointRadius:0,borderWidth:1},
+    {label:'Maximum',data:[],pointRadius:0,borderWidth:1}
+  ]},
+  options:{
+    responsive:true,maintainAspectRatio:false,animation:false,
+    interaction:{mode:'index',intersect:false},
+    onClick:function(event,elements,chart){
+      const p=chart.getElementsAtEventForMode(
+        event,'index',{intersect:false},false);
+      if(!p.length||!lastData)return;
+      const g=lastData.graph[p[0].index];
+      if(g)selectGraphPoint(g.epoch);
+    },
+    scales:{y:{title:{display:true,text:'Voltage (V)'}}}
+  }
+});
+
+function updateButtons(){
+  document.querySelectorAll('[data-window]').forEach(b=>{
+    b.classList.toggle('active',Number(b.dataset.window)===graphWindow);
+  });
+}
+
+document.querySelectorAll('[data-window]').forEach(b=>{
+  b.onclick=function(){
+    graphWindow=Number(this.dataset.window);
+    graphEnd=0;tableCenter=0;selectedEpoch=0;
+    updateButtons();refreshData();
+  };
+});
+
+function back(){
+  const base=graphEnd||(lastData?lastData.latest_epoch:0);
+  if(base){graphEnd=Math.floor(base-graphWindow*0.8);refreshData();}
+}
+function forward(){
+  if(!lastData)return;
+  if(!graphEnd){return;}
+  graphEnd=Math.floor(graphEnd+graphWindow*0.8);
+  if(graphEnd>=lastData.latest_epoch)graphEnd=0;
+  refreshData();
+}
+function goNow(){
+  graphEnd=0;tableCenter=0;selectedEpoch=0;refreshData();
+}
+
+function scrollTableToEpoch(epoch){
+  const rows=Array.from(
+    document.querySelectorAll('#measurementTable tr[data-epoch]'));
+  if(!rows.length)return;
+  let nearest=rows[0],d=Math.abs(Number(nearest.dataset.epoch)-epoch);
+  rows.forEach(r=>{
+    const nd=Math.abs(Number(r.dataset.epoch)-epoch);
+    if(nd<d){nearest=r;d=nd;}
+    r.classList.remove('measurement-selected');
+  });
+  nearest.classList.add('measurement-selected');
+  const sc=document.getElementById('tableScroll');
+  sc.scrollTop=nearest.offsetTop-sc.clientHeight/2+nearest.clientHeight/2;
+}
+
+function selectGraphPoint(epoch){
+  tableCenter=epoch;selectedEpoch=epoch;
+  refreshData().then(()=>setTimeout(()=>scrollTableToEpoch(epoch),80));
+}
+
+function selectEvent(epoch){
+  selectedEpoch=epoch;tableCenter=epoch;
+  graphEnd=Math.floor(epoch+graphWindow/2);
+  refreshData().then(()=>{
+    document.getElementById('chartWrap').scrollIntoView(
+      {behavior:'smooth',block:'center'});
+    setTimeout(()=>scrollTableToEpoch(epoch),150);
+  });
+}
+
+function render(data){
+  lastData=data;
+  document.getElementById('now').textContent=data.now_text||'Clock unavailable';
+  document.getElementById('status').textContent=
+    data.clock_valid?'Logging':'Waiting for NTP';
+  document.getElementById('avg').textContent=data.latest_avg.toFixed(3);
+  document.getElementById('min').textContent=data.latest_min.toFixed(3);
+  document.getElementById('max').textContent=data.latest_max.toFixed(3);
+  document.getElementById('samples').textContent=data.latest_samples;
+  document.getElementById('lowThreshold').textContent=
+    data.event_low_voltage.toFixed(2);
+  document.getElementById('dropThreshold').textContent=
+    data.event_drop_volts.toFixed(2);
+  document.getElementById('range').textContent=
+    data.range_start_text+' — '+data.range_end_text;
+
+  voltageChart.data.labels=data.graph.map(x=>x.time);
+  voltageChart.data.datasets[0].data=data.graph.map(x=>x.avg);
+  voltageChart.data.datasets[1].data=data.graph.map(x=>x.min);
+  voltageChart.data.datasets[2].data=data.graph.map(x=>x.max);
+  voltageChart.update();
+
+  let th='';
+  data.table.forEach(r=>{
+    const cls=(r.epoch===selectedEpoch)?' class="measurement-selected"':'';
+    th+='<tr data-epoch="'+r.epoch+'"'+cls+'>'+
+      '<td>'+r.time+'</td><td>'+r.avg.toFixed(3)+'</td>'+
+      '<td>'+r.min.toFixed(3)+'</td><td>'+r.max.toFixed(3)+'</td>'+
+      '<td>'+r.samples+'</td></tr>';
+  });
+  document.getElementById('measurementTable').innerHTML=th;
+
+  let eh='';
+  data.events.forEach(e=>{
+    eh+='<div class="event-row" onclick="selectEvent('+e.epoch+')">'+
+      '<b>'+e.time+'</b> — '+e.reason+'<br>'+
+      '<span class="small">Avg '+e.avg.toFixed(3)+' V, Min '+
+      e.min.toFixed(3)+' V, Max '+e.max.toFixed(3)+' V</span></div>';
+  });
+  document.getElementById('events').innerHTML=eh||'No events detected.';
+}
+
+async function refreshData(){
+  try{
+    let u='/api/data?window='+graphWindow;
+    if(graphEnd>0)u+='&end='+graphEnd;
+    if(tableCenter>0)u+='&table_center='+tableCenter;
+    const r=await fetch(u,{cache:'no-store'});
+    if(!r.ok)throw new Error('HTTP '+r.status);
+    const d=await r.json();
+    render(d);
+    return d;
+  }catch(e){
+    document.getElementById('status').textContent='Web error: '+e;
+  }
+}
+
+async function clearData(){
+  if(!confirm('Clear all stored voltage history?'))return;
+  const a=document.getElementById('action');
+  try{
+    const r=await fetch('/api/clear',{method:'POST'});
+    if(!r.ok)throw new Error('HTTP '+r.status);
+    graphEnd=0;tableCenter=0;selectedEpoch=0;
+    a.textContent='Data cleared';
+    await refreshData();
+  }catch(e){a.textContent='Clear failed: '+e;}
+}
+
+updateButtons();
+refreshData();
+setInterval(refreshData,10000);
+</script>
+</body>
+</html>
+'''
+
+
+def send_html(client):
+    send_headers(client, "text/html; charset=utf-8", cache=True)
+
+    # Avoid HTML.encode() of the complete page. Send modest slices.
+    pos = 0
+    chunk = 768
+    while pos < len(HTML):
+        send_all(client, HTML[pos:pos + chunk])
+        pos += chunk
+        gc.collect()
+
+
+# ============================================================
+# HTTP server
+# ============================================================
+
+def parse_request(client):
+    # Only the first request line is required. Limit it explicitly.
+    line = client.readline()
+    if not line:
+        return "", "", ""
+
+    try:
+        line = line.decode().strip()
+    except:
+        return "", "", ""
+
+    parts = line.split()
+    if len(parts) < 2:
+        return "", "", ""
+
+    method = parts[0]
+    target = parts[1]
+
+    # Consume headers without storing them.
+    while True:
+        h = client.readline()
+        if not h or h == b"\r\n" or h == b"\n":
+            break
+
+    if "?" in target:
+        path, query = target.split("?", 1)
+    else:
+        path, query = target, ""
+
+    return method, path, query
+
+
+def handle_client(client):
+    method, path, query = parse_request(client)
+
+    if path == "/":
+        send_html(client)
+
+    elif path == "/api/data":
+        stream_api(client, query)
+
+    elif path == "/api/clear" and method == "POST":
+        clear_history()
+        send_headers(client)
+        send_all(client, '{"ok":true}')
+
+    else:
+        send_headers(client, "text/plain", "404 Not Found")
+        send_all(client, "Not found")
+
+
+def start_server():
+    global server
+
+    addr = socket.getaddrinfo("0.0.0.0", HTTP_PORT)[0][-1]
+    server = socket.socket()
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(addr)
+    server.listen(2)
+    server.settimeout(0.05)
+
+    print("Web server listening on http://{}/".format(
+        wlan.ifconfig()[0]
+    ))
+
+
+# ============================================================
+# Main
+# ============================================================
+
+def main():
+    global last_sample_ticks, last_record_ticks
+
+    print()
+    print("Pico voltage logger starting")
+    print("Binary ring: {} records, {} bytes".format(
+        MAX_RECORDS, FILE_SIZE
+    ))
+
+    gc.collect()
+    print("Free RAM at startup:", gc.mem_free())
+
+    last_sample_ticks = time.ticks_ms()
+    last_record_ticks = last_sample_ticks
+
+    start_ble_console()
+    ensure_data_file()
+
+    wifi_ok = connect_wifi()
+    if wifi_ok:
+        # NTP must succeed before timestamped history is interpreted.
+        sync_ntp()
+        if clock_valid:
+            find_latest_record()
+        start_server()
+    else:
+        print("Wi-Fi unavailable; BLE configuration console remains available")
+    gc.collect()
+    print("Free RAM before main loop:", gc.mem_free())
+
+    last_wifi_retry_ticks = time.ticks_ms()
+
+    while True:
+        sample_if_due()
+        service_ble()
+
+        now_ticks = time.ticks_ms()
+
+        if time.ticks_diff(now_ticks, last_record_ticks) >= RECORD_INTERVAL_MS:
+            # Advance by one interval rather than setting to now, but do
+            # not manufacture samples for time spent blocked.
+            last_record_ticks = now_ticks
+            record_interval()
+
+        if wlan and wlan.isconnected():
+            if clock_valid:
+                now = now_unix()
+                if now - last_ntp_sync_unix >= NTP_RESYNC_SECONDS:
+                    sync_ntp()
+            else:
+                if time.ticks_diff(now_ticks, last_wifi_retry_ticks) >= 60000:
+                    last_wifi_retry_ticks = now_ticks
+                    sync_ntp()
+        elif time.ticks_diff(now_ticks, last_wifi_retry_ticks) >= 60000:
+            last_wifi_retry_ticks = now_ticks
+            print("Retrying Wi-Fi...")
+            if connect_wifi():
+                sync_ntp()
+                if clock_valid:
+                    find_latest_record()
+                if server is None:
+                    start_server()
+
+        if server is not None:
+            try:
+                client, addr = server.accept()
+            except OSError:
+                client = None
+        else:
+            client = None
+
+        if client:
+            try:
+                client.settimeout(3)
+                gc.collect()
+                handle_client(client)
+            except Exception as e:
+                print("HTTP error:", e)
+            finally:
+                try:
+                    client.close()
+                except:
+                    pass
+                gc.collect()
+
+        time.sleep_ms(1)
+
+
+main()

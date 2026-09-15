@@ -1,0 +1,18 @@
+{
+  "wifi_ssid": "WIFI_SID",
+  "wifi_password": "WIFI_PW",
+  "ntp_server": "uk.pool.ntp.org",
+  "ntp_resync_seconds": 3600,
+  "sample_interval_ms": 10,
+  "record_interval_ms": 10000,
+  "history_seconds": 86400,
+  "http_port": 80,
+  "event_low_voltage": 11.5,
+  "event_drop_volts": 0.5,
+  "max_events": 100,
+  "max_table_rows": 100,
+  "max_graph_points": 720,
+  "device_name": "Pico-Voltage-Logger",
+  "ble_enabled": true,
+  "localecho": true
+}
