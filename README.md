@@ -563,6 +563,32 @@ hours of measurements. Minimum voltage is stored separately from the
 average so short voltage dips are less likely to disappear through
 averaging.
 
+The file is created at full size and never grows: once full, each new
+record overwrites the oldest. With the defaults (a record every 10
+seconds, 24 hours of history) it holds 8,640 records, which is
+103,680 bytes. Neither RAM nor flash use grows however long the logger
+runs.
+
+The record interval and history length can be changed (`history_seconds`
+and `record_interval_ms`, on the Settings page or over BLE). History is
+capped at 20,000 records (240 KB), 55 hours at the default interval.
+Changing either setting resizes the file at the next restart, which
+erases the stored history.
+
+### Memory budget
+
+Measured on a Pico W running this firmware:
+
+| | Available | Free while logging |
+|---|---|---|
+| RAM (MicroPython heap) | about 188 KB | about 85 KB |
+| Flash (file system) | 848 KB | about 510 KB |
+
+An over-the-air update needs free flash of at least three times the
+package size plus 32 KB (about 335 KB for a 100 KB update). Note that a
+longer history reduces that headroom. RAM, not logging, is the limit
+for new features: the web pages are held in RAM as part of `app.py`.
+
 ## Status LED
 
 The Pico W's on-board LED shows the network state:

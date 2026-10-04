@@ -51,6 +51,11 @@ true in the device's `config.json`, the watchdog is armed and will reset the boa
 after the program is interrupted, which breaks `mpremote`/`deploy.py` sessions. Check
 `/api/update/status` (`watchdog` field) before USB work, and turn it off over BLE first.
 
+Memory is the main constraint on new features: the README's "Memory budget" section has measured
+figures (about 85 KB of RAM free while logging out of about 188 KB; about 510 KB of flash free).
+The web pages live in RAM as string constants in `app.py`. If they need to grow much more,
+consider serving them from files in flash.
+
 There is no local way to "run" this project off-device; verifying changes means flashing to a
 Pico W (or reasoning carefully about MicroPython semantics, which differ from CPython — see
 below). Pure-logic parts (package signing/staging, bootstrap apply/rollback) can be exercised
