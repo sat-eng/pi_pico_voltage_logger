@@ -145,7 +145,9 @@ class BLEConsole:
                 if ((first == 13 and second == 10) or
                         (first == 10 and second == 13)):
                     consume += 1
-            del self.rx[:consume]
+            # MicroPython's bytearray has no slice deletion (del rx[:n]
+            # raises TypeError), so keep the remainder as a new buffer.
+            self.rx = self.rx[consume:]
             self.rx_last_write_ms = time.ticks_ms() if self.rx else None
             self._run_line(raw)
 

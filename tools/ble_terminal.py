@@ -15,7 +15,7 @@ Usage:
                                          addresses are UUIDs, as shown by --scan)
   echo status | tools/ble_terminal.py    run commands non-interactively
 
-Quit with Ctrl-D (or Ctrl-C).
+Quit with "quit", "exit", Ctrl-D or Ctrl-C.
 """
 
 import argparse
@@ -31,10 +31,12 @@ except ImportError:
 DEFAULT_NAME = "Pico-Voltage-Logger"
 NUS_RX = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"   # we write commands here
 NUS_TX = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"   # the logger notifies output here
-# The logger's RX characteristic holds 20 bytes per write, and it treats
-# 500 ms without input as the end of a command, so send each line as
-# 20-byte writes in quick succession.
+# 20 bytes is the largest write that fits the default BLE MTU (23 bytes)
+# without negotiating a bigger one. The logger treats 500 ms without
+# input as the end of a command, so the chunks are sent back to back.
 CHUNK = 20
+# Typed locally to leave the terminal; never sent to the logger.
+QUIT_COMMANDS = ("quit", "exit")
 
 
 async def scan(timeout):
@@ -121,7 +123,8 @@ async def run(args):
 
     async with BleakClient(device, disconnected_callback=on_disconnect) as client:
         if interactive:
-            print("Connected to {} ({}). Type 'help' for commands; Ctrl-D to quit."
+            print("Connected to {} ({}). Type 'help' for logger commands; "
+                  "'quit' or Ctrl-D to exit."
                   .format(device.name or args.name, device.address))
         await client.start_notify(NUS_TX, on_notify)
 
@@ -141,6 +144,8 @@ async def run(args):
             if line == "":
                 # End of input: give the last command time to answer.
                 await asyncio.sleep(args.linger)
+                break
+            if line.strip().lower() in QUIT_COMMANDS:
                 break
             echo.sent(line)
             data = (line.rstrip("\r\n") + "\n").encode()

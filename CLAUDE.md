@@ -111,14 +111,17 @@ under CPython with stubbed `machine`/`time` modules.
   chunking (20 bytes), and deferred connection welcome (sent from `poll()`, not the IRQ handler,
   since BLE IRQ callbacks must stay short and terminals need time to subscribe to notifications).
   It calls back into `app.py` via injected `line_handler`/`connect_handler`/`echo_handler`
-  functions — it has no knowledge of what commands mean.
+  functions — it has no knowledge of what commands mean. Mind MicroPython's narrower builtins:
+  e.g. `bytearray` has no slice deletion (`del buf[:n]` raises `TypeError`), which crashed the
+  logger on every newline-terminated command until fixed; test such code on the device, not just
+  CPython.
 
 - **`tools/`** — host-side tools (CPython), kept out of the top level so they're never
   mistaken for firmware: everything at the top level goes on the Pico, nothing in `tools/` does.
   `deploy.py` (USB updater), `make_package.py` (over-the-air package builder/uploader) and
-  `ble_terminal.py` (interactive NUS console over `bleak`; writes 20-byte chunks because the
-  logger's RX characteristic holds 20 bytes and a 500 ms gap ends a command; filters the
-  logger's `localecho` echo). The tools use `REPO` (the parent of `tools/`) for firmware files,
+  `ble_terminal.py` (interactive NUS console over `bleak`; sends 20-byte writes back to back,
+  the default-MTU payload, since a 500 ms gap ends a command on the logger; filters the logger's
+  `localecho` echo; `quit`/`exit` are handled locally). The tools use `REPO` (the parent of `tools/`) for firmware files,
   `.update-key`, `.deploy-device` and `dist/`. On macOS, Local Network privacy can block Python's
   HTTP to the LAN (errno 65) while the system `curl` is allowed, so `make_package.py` falls
   back to `curl` in that case.

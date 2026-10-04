@@ -410,7 +410,8 @@ tools/ble_terminal.py --name NAME     # if you changed device_name
 echo status | tools/ble_terminal.py   # run commands from a script
 ```
 
-Type commands as usual and quit with Ctrl-D. The terminal hides the
+Type commands as usual and leave with `quit`, `exit` or Ctrl-D. These
+are handled by the terminal, not sent to the logger. The terminal hides the
 logger's echo of each command, since you can already see what you typed
 (`--show-echo` keeps it). On macOS, the first run asks you to allow
 Bluetooth for your terminal app.
