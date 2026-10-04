@@ -424,4 +424,4 @@ When measuring vehicle electrical systems:
 This project is licensed under the MIT License.
 
 Copyright © 2026 Satish Kunapuli.
-See the [LICENSE](LICENSE) file for details.
+See the [LICENCE](LICENCE) file for details.
