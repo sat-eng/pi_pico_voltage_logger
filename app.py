@@ -6,6 +6,8 @@ import os
 import gc
 import json
 import machine
+import hashlib
+import binascii
 
 from machine import ADC, RTC, Pin
 from config_manager import load as load_config, save as save_config, defaults as default_config, validate as validate_config
@@ -268,8 +270,10 @@ def sample_if_due():
 
 def service_sampling():
     # Called from file/HTTP loops so long requests continue sampling as
-    # often as practical.
+    # often as practical. Also feeds the watchdog, which main.py arms
+    # while an over-the-air update is unconfirmed.
     sample_if_due()
+    feed_watchdog()
 
 
 LIVE_BURST = 16
@@ -535,7 +539,7 @@ def clear_history():
 # ============================================================
 
 def _config_value_text(key, value):
-    if key == "wifi_password":
+    if key in ("wifi_password", "update_key"):
         return "********" if value else ""
     return str(value)
 
@@ -565,7 +569,19 @@ def config_command(line):
 
     if cmd == "help":
         return ("Commands: help, show, get <key>, set <key> <value>, save, "
-                "status, defaults, clear-data, reboot, apply, apply --clear")
+                "status, defaults, clear-data, reboot, apply, apply --clear, "
+                "update-status, rollback")
+
+    if cmd == "update-status":
+        return update_status_text()
+
+    if cmd == "rollback":
+        if not request_rollback():
+            return "No previous version to roll back to."
+        if ble_console:
+            ble_console.write("Rolling back to the previous version; rebooting...\r\n")
+        time.sleep_ms(300)
+        machine.reset()
 
     if cmd == "show":
         lines = []
@@ -1066,6 +1082,314 @@ def stream_api(client, query):
 
 
 # ============================================================
+# Over-the-air update
+#
+# app.py only receives, verifies and stages a package (<name>.new files
+# plus update_ready.json). main.py, the bootstrap, swaps the files in at
+# the next boot, keeps the previous versions as <name>.old, and rolls
+# back if the new code fails before this module confirms it.
+#
+# Package format (built by make_package.py):
+#   b"PVLPKG1 <hex HMAC-SHA256 of everything after this line>\n"
+#   JSON header line: {"version", "created", "files": [{name, size, sha256}]}
+#   the files' bytes, concatenated in header order
+# ============================================================
+
+UPDATABLE_FILES = ("app.py", "ble_console.py", "config_manager.py")
+UPDATE_STATE_FILE = "update_state.json"
+UPDATE_READY_FILE = "update_ready.json"
+ROLLBACK_REQUEST_FILE = "update_rollback.json"
+UPDATE_PACKAGE_FILE = "update.pkg"
+PACKAGE_MAGIC = b"PVLPKG1"
+MAX_PACKAGE_BYTES = 256 * 1024
+# How long new code must run, with the web server up, before it is
+# confirmed and the watchdog released.
+UPDATE_COMMIT_MS = 60000
+
+WATCHDOG = None
+update_state = {}
+reboot_requested = False
+loop_start_ticks = 0
+
+
+def feed_watchdog():
+    if WATCHDOG is not None:
+        WATCHDOG.feed()
+
+
+def file_exists(path):
+    try:
+        os.stat(path)
+        return True
+    except OSError:
+        return False
+
+
+def remove_file(path):
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def read_json_file(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def write_json_file(path, data):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f)
+    try:
+        os.rename(tmp, path)
+    except OSError:
+        remove_file(path)
+        os.rename(tmp, path)
+
+
+def hex_digest(h):
+    # MicroPython's hashlib has no hexdigest().
+    return binascii.hexlify(h.digest()).decode()
+
+
+def file_sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(1024)
+            if not chunk:
+                break
+            h.update(chunk)
+            service_sampling()
+    return hex_digest(h)
+
+
+class HmacSha256:
+    # Streaming HMAC-SHA256 (MicroPython has no hmac module).
+    def __init__(self, key):
+        if len(key) > 64:
+            key = hashlib.sha256(key).digest()
+        key = key + bytes(64 - len(key))
+        inner = bytearray(64)
+        self._outer = bytearray(64)
+        for i in range(64):
+            inner[i] = key[i] ^ 0x36
+            self._outer[i] = key[i] ^ 0x5C
+        self._inner = hashlib.sha256(inner)
+
+    def update(self, data):
+        self._inner.update(data)
+
+    def digest(self):
+        outer = hashlib.sha256(self._outer)
+        outer.update(self._inner.digest())
+        return outer.digest()
+
+
+def digests_equal(a, b):
+    # Constant-time comparison.
+    if len(a) != len(b):
+        return False
+    diff = 0
+    for x, y in zip(a, b):
+        diff |= x ^ y
+    return diff == 0
+
+
+def clear_staged_update():
+    for name in UPDATABLE_FILES:
+        remove_file(name + ".new")
+    remove_file(UPDATE_READY_FILE)
+    remove_file(UPDATE_PACKAGE_FILE)
+
+
+def drain_body(client, remaining):
+    # Read and discard a rejected upload so the browser gets the reply.
+    while remaining > 0:
+        chunk = client.recv(min(1024, remaining))
+        if not chunk:
+            break
+        remaining -= len(chunk)
+        service_sampling()
+
+
+def read_header_line(client, limit):
+    # Read up to and including the first b"\n", but never more than
+    # `limit` bytes, so a body without a newline is rejected at once
+    # instead of waiting for the socket to time out.
+    line = b""
+    while len(line) < limit:
+        c = client.recv(1)
+        if not c:
+            break
+        line += c
+        if c == b"\n":
+            break
+    return line
+
+
+def stage_package():
+    # Unpack the verified package into <name>.new files and write the
+    # update_ready.json marker that main.py acts on at the next boot.
+    with open(UPDATE_PACKAGE_FILE, "rb") as f:
+        header = json.loads(f.readline())
+        created = int(header.get("created", 0))
+        if created <= int(update_state.get("last_created", 0)):
+            raise ValueError("package is not newer than the last one applied")
+        entries = header.get("files", [])
+        if not entries:
+            raise ValueError("package contains no files")
+
+        hashes = {}
+        for entry in entries:
+            name = entry["name"]
+            if name not in UPDATABLE_FILES:
+                raise ValueError("file cannot be updated over the air: " + name)
+            left = int(entry["size"])
+            h = hashlib.sha256()
+            with open(name + ".new", "wb") as out:
+                while left > 0:
+                    chunk = f.read(min(1024, left))
+                    if not chunk:
+                        raise ValueError("package truncated")
+                    h.update(chunk)
+                    out.write(chunk)
+                    left -= len(chunk)
+                    service_sampling()
+            if hex_digest(h) != entry["sha256"]:
+                raise ValueError("hash mismatch for " + name)
+            hashes[name] = entry["sha256"]
+
+        if f.read(1):
+            raise ValueError("unexpected data after the last file")
+
+    write_json_file(UPDATE_READY_FILE, {
+        "version": str(header.get("version", "")),
+        "created": created,
+        "files": hashes,
+    })
+    return str(header.get("version", "")), sorted(hashes)
+
+
+def receive_update(client, length):
+    # Returns (version, files). Raises ValueError with a message for the
+    # browser if the upload is rejected.
+    key = CONFIG.get("update_key", "")
+    if length <= 0 or length > MAX_PACKAGE_BYTES:
+        raise ValueError("package size must be 1..{} bytes".format(
+            MAX_PACKAGE_BYTES))
+
+    reason = None
+    if not key:
+        reason = "updates are disabled: set update_key over BLE"
+    elif update_state.get("state") == "pending":
+        reason = "the previous update is not confirmed yet"
+    else:
+        s = os.statvfs("/")
+        if s[0] * s[3] < length * 3 + 32768:
+            reason = "not enough flash space"
+    if reason:
+        drain_body(client, length)
+        raise ValueError(reason)
+
+    first = read_header_line(client, min(length, 100))
+    parts = first.strip().split()
+    if len(parts) != 2 or parts[0] != PACKAGE_MAGIC:
+        drain_body(client, length - len(first))
+        raise ValueError("not an update package")
+    try:
+        signature = binascii.unhexlify(parts[1])
+    except ValueError:
+        drain_body(client, length - len(first))
+        raise ValueError("malformed signature")
+
+    clear_staged_update()
+    mac = HmacSha256(key.encode())
+    remaining = length - len(first)
+    with open(UPDATE_PACKAGE_FILE, "wb") as f:
+        while remaining > 0:
+            chunk = client.recv(min(1024, remaining))
+            if not chunk:
+                raise ValueError("connection closed during upload")
+            mac.update(chunk)
+            f.write(chunk)
+            remaining -= len(chunk)
+            service_sampling()
+
+    try:
+        if not digests_equal(mac.digest(), signature):
+            raise ValueError("signature check failed (wrong update_key?)")
+        return stage_package()
+    except Exception:
+        clear_staged_update()
+        raise
+    finally:
+        remove_file(UPDATE_PACKAGE_FILE)
+
+
+def update_status_json():
+    st = update_state
+    files = {}
+    for name in UPDATABLE_FILES:
+        if file_exists(name):
+            files[name] = file_sha256(name)
+    return json.dumps({
+        "state": st.get("state", "none"),
+        "version": st.get("version", ""),
+        "attempts": st.get("attempts", 0),
+        "reason": st.get("reason", ""),
+        "previous": [n for n in UPDATABLE_FILES if file_exists(n + ".old")],
+        "enabled": bool(CONFIG.get("update_key", "")),
+        "files": files,
+    })
+
+
+def update_status_text():
+    st = update_state
+    lines = ["Update state: {}".format(st.get("state", "none"))]
+    if st.get("version"):
+        lines.append("Version: {}".format(st["version"]))
+    if st.get("reason"):
+        lines.append("Reason: {}".format(st["reason"]))
+    previous = [n for n in UPDATABLE_FILES if file_exists(n + ".old")]
+    lines.append("Rollback available: {}".format(
+        ", ".join(previous) if previous else "no"))
+    lines.append("Updates: {}".format(
+        "enabled" if CONFIG.get("update_key", "") else
+        "disabled (set update_key)"))
+    return "\r\n".join(lines)
+
+
+def request_rollback():
+    # main.py performs the rollback at boot.
+    if not any(file_exists(n + ".old") for n in UPDATABLE_FILES):
+        return False
+    write_json_file(ROLLBACK_REQUEST_FILE, {"requested": True})
+    return True
+
+
+def check_update_commit():
+    # Confirm a pending update once the new code has run for a while with
+    # the web server up (so a fix can still be uploaded), then restart to
+    # release the watchdog.
+    if update_state.get("state") != "pending" or server is None:
+        return
+    if time.ticks_diff(time.ticks_ms(), loop_start_ticks) < UPDATE_COMMIT_MS:
+        return
+    update_state["state"] = "good"
+    update_state["attempts"] = 0
+    write_json_file(UPDATE_STATE_FILE, update_state)
+    print("Update {} confirmed; restarting to release the watchdog".format(
+        update_state.get("version", "")))
+    time.sleep_ms(200)
+    machine.reset()
+
+
+# ============================================================
 # Web page
 # ============================================================
 
@@ -1165,7 +1489,8 @@ thead th{position:sticky;top:0;background:white;z-index:1}
 
 <div class="card">
   <button onclick="clearData()">Clear stored data</button>
-  <a href="/calibrate">Calibrate ADC</a>
+  <a href="/calibrate">Calibrate ADC</a> &middot;
+  <a href="/update">Firmware update</a>
   <span id="action"></span>
 </div>
 
@@ -1550,6 +1875,108 @@ setInterval(refreshLive,1000);
 '''
 
 
+UPDATE_HTML = r'''<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Firmware update - Pico Voltage Logger</title>
+<style>
+body{font-family:Arial,sans-serif;margin:18px;background:#f5f5f5;color:#222}
+.card{background:white;padding:16px;margin-bottom:16px;border-radius:8px}
+h1,h2{margin-top:0}
+button{padding:7px 10px;margin:2px;cursor:pointer}
+td{padding:3px 12px 3px 0;vertical-align:top}
+.small{font-size:.9em;color:#555}
+.ok{color:#1a7f37}.bad{color:#c62828}
+code{word-break:break-all}
+</style>
+</head>
+<body>
+<h1>Firmware update</h1>
+<p><a href="/">&larr; Back to logger</a></p>
+
+<div class="card">
+  <h2>Status</h2>
+  <table>
+    <tr><td>State</td><td id="state">--</td></tr>
+    <tr><td>Version</td><td id="version">--</td></tr>
+    <tr><td>Rollback available</td><td id="previous">--</td></tr>
+    <tr><td>Updates</td><td id="enabled">--</td></tr>
+  </table>
+  <div class="small" id="reason"></div>
+</div>
+
+<div class="card">
+  <h2>Upload package</h2>
+  <p class="small">Choose a <code>.pvlpkg</code> file built with
+  <code>make_package.py</code>. The logger checks its signature, stages
+  the files and reboots. The new version is confirmed after it has run
+  for a minute with the web server up; if it fails first, the logger
+  rolls back to the previous version.</p>
+  <input type="file" id="pkg" accept=".pvlpkg">
+  <button onclick="upload()">Upload and install</button>
+  <div id="action" style="margin-top:10px"></div>
+</div>
+
+<script>
+const STATES={none:'No update installed',pending:'Pending confirmation',
+  good:'Confirmed',rolled_back:'Rolled back',usb_deployed:'Deployed over USB'};
+
+async function loadStatus(){
+  try{
+    const d=await (await fetch('/api/update/status',{cache:'no-store'})).json();
+    document.getElementById('state').textContent=STATES[d.state]||d.state;
+    document.getElementById('version').textContent=d.version||'--';
+    document.getElementById('previous').textContent=
+      d.previous.length?d.previous.join(', '):'no';
+    document.getElementById('enabled').innerHTML=d.enabled?
+      '<span class="ok">enabled</span>':
+      '<span class="bad">disabled: set update_key over BLE</span>';
+    document.getElementById('reason').textContent=d.reason?('Reason: '+d.reason):'';
+    return d;
+  }catch(e){return null;}
+}
+
+async function upload(){
+  const f=document.getElementById('pkg').files[0];
+  const a=document.getElementById('action');
+  if(!f){a.innerHTML='<span class="bad">Choose a package first.</span>';return;}
+  a.textContent='Uploading '+f.name+' ('+f.size+' bytes)...';
+  try{
+    const r=await fetch('/api/update',{method:'POST',body:f});
+    const d=await r.json();
+    if(!d.ok)throw new Error(d.error||('HTTP '+r.status));
+    a.innerHTML='<span class="ok">Installed '+(d.version||'')+' ('+
+      d.files.join(', ')+'). Rebooting; this page will show when the '+
+      'update is confirmed.</span>';
+    waitForConfirm();
+  }catch(e){a.innerHTML='<span class="bad">Upload failed: '+e.message+'</span>';}
+}
+
+function waitForConfirm(){
+  const a=document.getElementById('action');
+  const start=Date.now();
+  const t=setInterval(async()=>{
+    const d=await loadStatus();
+    if(d&&d.state==='good'){clearInterval(t);
+      a.innerHTML='<span class="ok">Update confirmed.</span>';}
+    else if(d&&d.state==='rolled_back'){clearInterval(t);
+      a.innerHTML='<span class="bad">The new version failed and was rolled back: '+
+        d.reason+'</span>';}
+    else if(Date.now()-start>300000){clearInterval(t);
+      a.innerHTML='<span class="bad">No confirmation after 5 minutes; '+
+        'check update-status over BLE.</span>';}
+  },5000);
+}
+
+loadStatus();
+</script>
+</body>
+</html>
+'''
+
+
 def send_page(client, page):
     send_headers(client, "text/html; charset=utf-8", cache=True)
 
@@ -1570,42 +1997,74 @@ def parse_request(client):
     # Only the first request line is required. Limit it explicitly.
     line = client.readline()
     if not line:
-        return "", "", ""
+        return "", "", "", 0
 
     try:
         line = line.decode().strip()
     except:
-        return "", "", ""
+        return "", "", "", 0
 
     parts = line.split()
     if len(parts) < 2:
-        return "", "", ""
+        return "", "", "", 0
 
     method = parts[0]
     target = parts[1]
 
-    # Consume headers without storing them.
+    # Consume headers without storing them; only Content-Length is kept
+    # (needed to read an uploaded update package).
+    length = 0
     while True:
         h = client.readline()
         if not h or h == b"\r\n" or h == b"\n":
             break
+        if h[:1] in (b"C", b"c"):
+            try:
+                name, value = h.decode().split(":", 1)
+                if name.strip().lower() == "content-length":
+                    length = int(value.strip())
+            except Exception:
+                pass
 
     if "?" in target:
         path, query = target.split("?", 1)
     else:
         path, query = target, ""
 
-    return method, path, query
+    return method, path, query, length
 
 
 def handle_client(client):
-    method, path, query = parse_request(client)
+    global reboot_requested
+    method, path, query, length = parse_request(client)
 
     if path == "/":
         send_page(client, HTML)
 
     elif path == "/calibrate":
         send_page(client, CAL_HTML)
+
+    elif path == "/update":
+        send_page(client, UPDATE_HTML)
+
+    elif path == "/api/update/status":
+        send_headers(client)
+        send_all(client, update_status_json())
+
+    elif path == "/api/update" and method == "POST":
+        try:
+            version, files = receive_update(client, length)
+        except Exception as e:
+            print("Update rejected:", e)
+            send_headers(client, status="400 Bad Request")
+            send_all(client, '{{"ok":false,"error":{}}}'.format(
+                json_string(e)))
+        else:
+            print("Update {} staged: {}; rebooting".format(version, files))
+            send_headers(client)
+            send_all(client, json.dumps(
+                {"ok": True, "version": version, "files": files}))
+            reboot_requested = True
 
     elif path == "/api/data":
         stream_api(client, query)
@@ -1683,11 +2142,20 @@ def start_server():
 # Main
 # ============================================================
 
-def main():
+def main(watchdog=None):
     global last_sample_ticks, last_record_ticks
+    global WATCHDOG, update_state, loop_start_ticks
+
+    WATCHDOG = watchdog
+    update_state = read_json_file(UPDATE_STATE_FILE) or {}
 
     print()
     print("Pico voltage logger starting")
+    if update_state.get("state"):
+        print("Update state: {} {}".format(
+            update_state.get("state"), update_state.get("version", "")))
+    if WATCHDOG is not None:
+        print("Watchdog armed until the update is confirmed")
     print("Binary ring: {} records, {} bytes".format(
         MAX_RECORDS, FILE_SIZE
     ))
@@ -1717,11 +2185,14 @@ def main():
     print("Free RAM before main loop:", gc.mem_free())
 
     last_wifi_retry_ticks = time.ticks_ms()
+    loop_start_ticks = last_wifi_retry_ticks
 
     while True:
         sample_if_due()
+        feed_watchdog()
         service_ble()
         service_led()
+        check_update_commit()
 
         now_ticks = time.ticks_ms()
 
@@ -1772,7 +2243,15 @@ def main():
                     pass
                 gc.collect()
 
+            if reboot_requested:
+                # A verified update is staged; main.py applies it at boot.
+                time.sleep_ms(500)
+                machine.reset()
+
         time.sleep_ms(1)
 
 
-main()
+# main.py (the bootstrap) imports this module and calls main(); running
+# app.py directly also works for development.
+if __name__ == "__main__":
+    main()

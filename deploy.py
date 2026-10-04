@@ -41,8 +41,27 @@ import time
 PROJECT = "pi_pico_voltage_logger"
 MANIFEST_NAME = ".deploy-manifest.json"
 DEVICE_CACHE = ".deploy-device"     # local, untracked: last known board serial
-MANAGED_FILES = ["main.py", "ble_console.py", "config_manager.py"]
+MANAGED_FILES = ["main.py", "app.py", "ble_console.py", "config_manager.py"]
 INIT_ONLY_IF_MISSING = ["config.json"]
+
+# Run on the device after a USB deploy: drop over-the-air backups and any
+# staged update, so a later BLE "rollback" cannot restore files older than
+# what was just deployed. The replay-protection timestamp is kept.
+CLEAR_OTA_STATE = """
+import os, json
+for n in ('app.py', 'ble_console.py', 'config_manager.py'):
+    for s in ('.old', '.new'):
+        try: os.remove(n + s)
+        except OSError: pass
+for n in ('update_ready.json', 'update_rollback.json', 'update.pkg'):
+    try: os.remove(n)
+    except OSError: pass
+try:
+    with open('update_state.json') as f: last = json.load(f).get('last_created', 0)
+except (OSError, ValueError): last = 0
+with open('update_state.json', 'w') as f:
+    json.dump({'state': 'usb_deployed', 'last_created': last}, f)
+"""
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -248,7 +267,8 @@ def main():
                                      delete=False) as tmp:
         json.dump(new_manifest, tmp, indent=1)
     try:
-        cmd += ["fs", "cp", tmp.name, ":" + MANIFEST_NAME, "+", "reset"]
+        cmd += ["fs", "cp", tmp.name, ":" + MANIFEST_NAME, "+",
+                "exec", CLEAR_OTA_STATE, "+", "reset"]
         mp(mpremote, cmd, timeout=180)
     finally:
         os.unlink(tmp.name)

@@ -1,3 +1,6 @@
 # Local cache of the logger board's USB serial (written by deploy.py)
 .deploy-device
 __pycache__/
+# Over-the-air update signing key (make_package.py --gen-key) and built packages
+.update-key
+dist/

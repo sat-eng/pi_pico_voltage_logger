@@ -33,15 +33,22 @@ when an appropriate input divider and protection circuit are used.
 -   Configuration stored in `config.json`
 -   Wi-Fi configuration can be changed over BLE
 -   Stored history can be cleared from the BLE console
+-   Signed over-the-air updates over Wi-Fi with automatic rollback
 
 ## Files
 
   -----------------------------------------------------------------------
   File                                Purpose
   ----------------------------------- -----------------------------------
-  `main.py`                           Main logger, sampling, binary
+  `main.py`                           Bootstrap: applies staged
+                                      over-the-air updates, runs the app
+                                      and rolls back failed updates.
+                                      Updated over USB only
+
+  `app.py`                            Main logger, sampling, binary
                                       history, web server, event
-                                      detection and BLE command handling
+                                      detection, BLE command handling
+                                      and over-the-air update receiver
 
   `ble_console.py`                    Nordic UART Service BLE terminal
                                       implementation
@@ -51,8 +58,11 @@ when an appropriate input divider and protection circuit are used.
 
   `config.json`                       User configuration
 
-  `deploy.py`                         Hash-based updater: copies changed
-                                      files to the Pico and restarts it
+  `deploy.py`                         USB updater: copies changed files
+                                      to the Pico and restarts it
+
+  `make_package.py`                   Builds signed over-the-air update
+                                      packages
 
   `calibration.data`                  ADC calibration (slope/offset).
                                       Created on the device at first
@@ -186,6 +196,7 @@ For example, if the Pico appears on macOS as `/dev/cu.usbmodem1451201`:
 
 ``` bash
 mpremote connect /dev/cu.usbmodem1451201 fs cp main.py :main.py
+mpremote connect /dev/cu.usbmodem1451201 fs cp app.py :app.py
 mpremote connect /dev/cu.usbmodem1451201 fs cp ble_console.py :ble_console.py
 mpremote connect /dev/cu.usbmodem1451201 fs cp config_manager.py :config_manager.py
 mpremote connect /dev/cu.usbmodem1451201 fs cp config.json :config.json
@@ -206,7 +217,8 @@ the code without overwriting either:
 ```
 
 The device stores a manifest (`.deploy-manifest.json`) with the SHA-256
-of each deployed file (`main.py`, `ble_console.py`, `config_manager.py`).
+of each deployed file (`main.py`, `app.py`, `ble_console.py`,
+`config_manager.py`).
 `deploy.py` finds the board that holds this project's manifest, copies
 only the files whose hashes have changed, writes the new manifest and
 restarts the board. It never overwrites `config.json` or
@@ -224,6 +236,83 @@ so `deploy.py` always restarts the board, even when nothing changed. If
 you use `mpremote` by hand, finish with `reset`. `mpremote soft-reset`
 is not enough: it leaves the board at the raw REPL and `main.py` does
 not start.
+
+A USB deploy also removes any over-the-air backups (`*.old`) and staged
+files, so a later BLE `rollback` cannot restore code older than what
+was just deployed.
+
+## Over-the-Air Updates
+
+For a logger installed out of reach of USB, `app.py`,
+`ble_console.py` and `config_manager.py` can be updated over Wi-Fi.
+`main.py`, the bootstrap that applies updates and recovers from bad
+ones, is deliberately never updated over the air, so a broken remote
+update can always be undone.
+
+### One-time setup (over USB, before installing the logger)
+
+1.  Deploy the current firmware with `./deploy.py`. This installs the
+    bootstrap.
+2.  Create a signing key and install it on the logger:
+
+    ``` bash
+    ./make_package.py --gen-key
+    ```
+
+    This writes `.update-key` (git-ignored; keep it private) and prints
+    the BLE commands to run, `set update_key <key>` then `save`. Updates
+    are refused until a key is set.
+
+3.  Test an update and a rollback while USB is still connected (see
+    below).
+
+### Sending an update
+
+``` bash
+./make_package.py --device http://192.168.0.102 --upload
+```
+
+This asks the logger which files it runs, packages only the ones that
+differ, signs the package, uploads it and waits for the result. You can
+also build a package with `./make_package.py` (written to `dist/`) and
+upload the `.pvlpkg` file from the **Firmware update** page linked from
+the main page.
+
+On macOS, the Local Network privacy setting can stop Python reaching
+devices on your LAN ("No route to host"). `make_package.py` then falls
+back to the system `curl`. You can also allow Python under **System
+Settings › Privacy & Security › Local Network**.
+
+### What the logger does
+
+1.  **Verify and stage.** The upload is streamed to flash and its
+    HMAC-SHA256 signature checked against `update_key`. The package must
+    be newer than the last one applied, which blocks replays of old
+    packages. Each file's SHA-256 is checked, then the files are staged
+    as `<name>.new` and the logger reboots. Nothing running is
+    overwritten.
+2.  **Apply.** At boot, `main.py` moves the staged files into place and
+    keeps the replaced versions as `<name>.old`. Every step survives a
+    power cut.
+3.  **Trial.** The update is *pending*. A hardware watchdog is armed, so
+    a hang causes a reset.
+4.  **Confirm or roll back.**
+    -   The update is confirmed once the new code has run for 60 seconds
+        with the web server up, so a fix can still be uploaded. The
+        logger then restarts once to release the watchdog.
+    -   If the new code raises an exception, or fails to confirm within
+        3 boots (for example, it keeps hanging), `main.py` restores the
+        `.old` files and reboots into the previous version.
+
+While an update is pending, a new upload is refused. The last update can
+also be undone by hand with the BLE `rollback` command, and
+`update-status` shows the current state. The cause of the last crash is
+saved on the device in `boot_error.txt`.
+
+Security notes: the key never crosses the network, but the web server
+uses plain HTTP and the signature only proves who built the package. Use
+a long random key (as `--gen-key` does) and keep the logger on a network
+you trust.
 
 ## Initial Configuration
 
@@ -291,6 +380,8 @@ clear-data
 reboot
 apply
 apply --clear
+update-status
+rollback
 ```
 
 Examples:
@@ -312,6 +403,11 @@ saves the configuration and reboots the Pico so settings that are read
 during startup become active.
 
 `apply --clear` additionally clears the stored voltage history.
+
+`update-status` shows the over-the-air update state, and `rollback`
+restores the version replaced by the last over-the-air update and
+reboots (see [Over-the-Air Updates](#over-the-air-updates)). The signing
+key is set with `set update_key <key>`; `show` masks it.
 
 ### Command Echo
 
@@ -415,12 +511,21 @@ committed `config.json` contain only example values, for example:
 Alternatively, keep the real `config.json` out of Git and provide a
 `config.example.json` in the repository.
 
+The over-the-air signing key is a second secret. It lives on the logger
+as `update_key` in `config.json`, and on your computer in `.update-key`.
+The repository's `config.json` keeps `update_key` empty, and
+`.update-key` is git-ignored. Anyone with the key can install code on
+the logger, so never commit it or share it. If it leaks, create a new
+one with `make_package.py --gen-key` (after deleting `.update-key`) and
+install it over BLE.
+
 A useful `.gitignore` entry is:
 
 ``` gitignore
 config.json
 calibration.data
 voltage.bin
+.update-key
 ```
 
 ## Development Notes

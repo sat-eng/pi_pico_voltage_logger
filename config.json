@@ -14,5 +14,6 @@
   "max_graph_points": 720,
   "device_name": "Pico-Voltage-Logger",
   "ble_enabled": true,
-  "localecho": true
+  "localecho": true,
+  "update_key": ""
 }

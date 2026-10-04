@@ -19,7 +19,10 @@ DEFAULTS = {
     "max_table_rows": 100,
     "max_graph_points": 720,
     "device_name": "Pico-Voltage-Logger",
-    "ble_enabled": True
+    "ble_enabled": True,
+    "localecho": True,
+    # Shared secret for signed over-the-air updates; empty disables them.
+    "update_key": ""
 }
 
 
@@ -39,6 +42,8 @@ def validate(cfg):
     out["ntp_server"] = str(out["ntp_server"])
     out["device_name"] = str(out["device_name"])[:24]
     out["ble_enabled"] = bool(out["ble_enabled"])
+    out["localecho"] = bool(out["localecho"])
+    out["update_key"] = str(out["update_key"]).strip()[:128]
 
     out["sample_interval_ms"] = max(1, int(out["sample_interval_ms"]))
     out["record_interval_ms"] = max(1000, int(out["record_interval_ms"]))
