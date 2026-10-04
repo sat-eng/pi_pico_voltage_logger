@@ -1107,6 +1107,9 @@ MAX_PACKAGE_BYTES = 256 * 1024
 UPDATE_COMMIT_MS = 60000
 
 WATCHDOG = None
+# main.py arms the watchdog on every boot when this was set in config.json
+# at boot (later BLE changes take effect after a reboot).
+PERMANENT_WATCHDOG = bool(CONFIG.get("watchdog_enabled", False))
 update_state = {}
 reboot_requested = False
 loop_start_ticks = 0
@@ -1344,6 +1347,7 @@ def update_status_json():
         "reason": st.get("reason", ""),
         "previous": [n for n in UPDATABLE_FILES if file_exists(n + ".old")],
         "enabled": bool(CONFIG.get("update_key", "")),
+        "watchdog": watchdog_status(),
         "files": files,
     })
 
@@ -1361,6 +1365,7 @@ def update_status_text():
     lines.append("Updates: {}".format(
         "enabled" if CONFIG.get("update_key", "") else
         "disabled (set update_key)"))
+    lines.append("Watchdog: {}".format(watchdog_status()))
     return "\r\n".join(lines)
 
 
@@ -1383,10 +1388,24 @@ def check_update_commit():
     update_state["state"] = "good"
     update_state["attempts"] = 0
     write_json_file(UPDATE_STATE_FILE, update_state)
+    if PERMANENT_WATCHDOG:
+        # The watchdog stays armed anyway, so there is nothing to release.
+        print("Update {} confirmed".format(update_state.get("version", "")))
+        return
     print("Update {} confirmed; restarting to release the watchdog".format(
         update_state.get("version", "")))
     time.sleep_ms(200)
     machine.reset()
+
+
+def watchdog_status():
+    if WATCHDOG is None:
+        if CONFIG.get("watchdog_enabled"):
+            return "off (enabled in config; reboot to arm)"
+        return "off"
+    if PERMANENT_WATCHDOG:
+        return "on (permanent)"
+    return "on (until the update is confirmed)"
 
 
 # ============================================================
@@ -1903,6 +1922,7 @@ code{word-break:break-all}
     <tr><td>Version</td><td id="version">--</td></tr>
     <tr><td>Rollback available</td><td id="previous">--</td></tr>
     <tr><td>Updates</td><td id="enabled">--</td></tr>
+    <tr><td>Watchdog</td><td id="watchdog">--</td></tr>
   </table>
   <div class="small" id="reason"></div>
 </div>
@@ -1933,6 +1953,7 @@ async function loadStatus(){
     document.getElementById('enabled').innerHTML=d.enabled?
       '<span class="ok">enabled</span>':
       '<span class="bad">disabled: set update_key over BLE</span>';
+    document.getElementById('watchdog').textContent=d.watchdog||'--';
     document.getElementById('reason').textContent=d.reason?('Reason: '+d.reason):'';
     return d;
   }catch(e){return null;}
@@ -2154,8 +2175,7 @@ def main(watchdog=None):
     if update_state.get("state"):
         print("Update state: {} {}".format(
             update_state.get("state"), update_state.get("version", "")))
-    if WATCHDOG is not None:
-        print("Watchdog armed until the update is confirmed")
+    print("Watchdog:", watchdog_status())
     print("Binary ring: {} records, {} bytes".format(
         MAX_RECORDS, FILE_SIZE
     ))

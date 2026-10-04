@@ -12,6 +12,10 @@
 #      hardware watchdog is armed. app.py confirms the update once it has
 #      run for a while; an exception, or MAX_PENDING_BOOTS boots without
 #      confirmation (hangs reset via the watchdog), restores the .old files.
+#      If watchdog_enabled is true in config.json, the watchdog is armed on
+#      every boot instead (hang protection for an unattended unit; note
+#      that it then resets the board ~8 s after a USB REPL/mpremote stops
+#      the program).
 #
 # Every step is written to survive power loss: state is recorded before
 # files are renamed, and renames are repeated safely on the next boot.
@@ -28,6 +32,7 @@ READY_FILE = "update_ready.json"
 ROLLBACK_REQUEST_FILE = "update_rollback.json"
 DEPLOY_MANIFEST = ".deploy-manifest.json"
 ERROR_LOG = "boot_error.txt"
+CONFIG_FILE = "config.json"
 MAX_PENDING_BOOTS = 3
 WATCHDOG_MS = 8000          # RP2040 maximum is about 8.3 s
 
@@ -148,6 +153,13 @@ def rollback(state, reason):
     return new_state
 
 
+def permanent_watchdog_enabled():
+    # Read config.json directly rather than through config_manager, so the
+    # bootstrap never depends on a file that can change over the air.
+    cfg = read_json(CONFIG_FILE) or {}
+    return cfg.get("watchdog_enabled") is True
+
+
 def log_exception(exc):
     try:
         with open(ERROR_LOG, "w") as f:
@@ -168,14 +180,21 @@ def boot():
         remove(ROLLBACK_REQUEST_FILE)
         state = rollback(state, "requested over BLE")
 
-    watchdog = None
-    if state.get("state") == "pending":
+    pending = state.get("state") == "pending"
+    if pending:
         state["attempts"] = state.get("attempts", 0) + 1
         write_json(STATE_FILE, state)
         if state["attempts"] > MAX_PENDING_BOOTS:
             rollback(state, "not confirmed after {} boots".format(
                 MAX_PENDING_BOOTS))
             machine.reset()
+
+    # Creating a WDT starts the hardware watchdog. There is no call to stop
+    # it: only a reset does, so "off" simply means not creating it on the
+    # next boot. Armed for an update trial, or on every boot when
+    # watchdog_enabled is set in config.json.
+    watchdog = None
+    if pending or permanent_watchdog_enabled():
         watchdog = machine.WDT(timeout=WATCHDOG_MS)
 
     try:

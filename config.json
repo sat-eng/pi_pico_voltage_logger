@@ -15,5 +15,6 @@
   "device_name": "Pico-Voltage-Logger",
   "ble_enabled": true,
   "localecho": true,
-  "update_key": ""
+  "update_key": "",
+  "watchdog_enabled": false
 }

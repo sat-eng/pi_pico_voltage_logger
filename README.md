@@ -34,6 +34,7 @@ when an appropriate input divider and protection circuit are used.
 -   Wi-Fi configuration can be changed over BLE
 -   Stored history can be cleared from the BLE console
 -   Signed over-the-air updates over Wi-Fi with automatic rollback
+-   Optional permanent hardware watchdog for unattended installations
 
 ## Files
 
@@ -299,7 +300,9 @@ Settings › Privacy & Security › Local Network**.
 4.  **Confirm or roll back.**
     -   The update is confirmed once the new code has run for 60 seconds
         with the web server up, so a fix can still be uploaded. The
-        logger then restarts once to release the watchdog.
+        logger then restarts once to release the watchdog, unless the
+        [permanent watchdog](#permanent-watchdog-optional) is on, in
+        which case it stays armed.
     -   If the new code raises an exception, or fails to confirm within
         3 boots (for example, it keeps hanging), `main.py` restores the
         `.old` files and reboots into the previous version.
@@ -308,6 +311,33 @@ While an update is pending, a new upload is refused. The last update can
 also be undone by hand with the BLE `rollback` command, and
 `update-status` shows the current state. The cause of the last crash is
 saved on the device in `boot_error.txt`.
+
+### Permanent watchdog (optional)
+
+By default the hardware watchdog only runs during an update trial. For
+an unattended installation you can arm it on every boot, so a hang in
+confirmed code also resets the logger instead of leaving it stuck until
+the battery is disconnected:
+
+``` text
+set watchdog_enabled true
+apply
+```
+
+The watchdog can't be switched off while it is running; only a reset
+stops it. To disable it, run `set watchdog_enabled false`, then `apply`.
+It is then not armed on the next boot.
+
+Leave it **off on the bench**. While it is on, anything that stops the
+logger's program resets the board about 8 seconds later. That includes
+`mpremote` and `deploy.py` (which interrupt the program to use the USB
+REPL) and pressing Ctrl-C at the REPL. If you need USB access to a unit
+with the watchdog on, switch it off over BLE first. `update-status`, and
+the Firmware update page, show whether the watchdog is armed.
+
+With the watchdog on, use an IP address for `ntp_server` rather than a
+hostname. A DNS lookup that times out can block for longer than the
+watchdog allows.
 
 Security notes: the key never crosses the network, but the web server
 uses plain HTTP and the signature only proves who built the package. Use
@@ -330,6 +360,11 @@ Important settings include:
   "localecho": true
 }
 ```
+
+Two further settings are normally set later over BLE: `update_key`, the
+signing key for [over-the-air updates](#over-the-air-updates) (empty
+disables updates), and `watchdog_enabled`, the
+[permanent watchdog](#permanent-watchdog-optional) (default `false`).
 
 The project contains additional sampling, history, web-server and
 event-detection settings. The BLE `show` command displays the complete

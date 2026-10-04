@@ -46,8 +46,10 @@ ever overwrites them; if copying by hand, copy only the changed `.py` files.
 
 Any `mpremote` command (even `fs ls`/`fs cat`) interrupts the running logger. Restart it with
 `mpremote … reset`. `mpremote … soft-reset` leaves the board in raw REPL, so `main.py` does
-**not** run. While an over-the-air update is pending, the watchdog is armed and will reset the
-board about 8 s after the program is interrupted.
+**not** run. While an over-the-air update is pending, or on every boot if `watchdog_enabled` is
+true in the device's `config.json`, the watchdog is armed and will reset the board about 8 s
+after the program is interrupted, which breaks `mpremote`/`deploy.py` sessions. Check
+`/api/update/status` (`watchdog` field) before USB work, and turn it off over BLE first.
 
 There is no local way to "run" this project off-device; verifying changes means flashing to a
 Pico W (or reasoning carefully about MicroPython semantics, which differ from CPython — see
@@ -63,8 +65,12 @@ under CPython with stubbed `machine`/`time` modules.
   calls `app.main(watchdog=…)`. State lives in `update_state.json` (`applying` → `pending` →
   `good`, or `rolling_back` → `rolled_back`, plus `usb_deployed` after `deploy.py`); state is
   written before files are renamed so every step is safe to repeat after power loss. While
-  `pending`, it arms `machine.WDT` and counts boots; an exception from the app, or more than
-  `MAX_PENDING_BOOTS` unconfirmed boots, restores the `.old` files. An exception from confirmed
+  `pending` it counts boots, and it arms `machine.WDT` while `pending` or on every boot when
+  `watchdog_enabled` is true in `config.json` (read directly with `json`, not via
+  `config_manager`, and only a real JSON `true` counts). A WDT cannot be stopped once created,
+  only by a reset, so "disabling" means not creating it on the next boot. While `pending`, an
+  exception from the app, or more than `MAX_PENDING_BOOTS` unconfirmed boots, restores the
+  `.old` files. An exception from confirmed
   code is logged to `boot_error.txt` and the board restarts after 10 s (unattended unit), except
   `KeyboardInterrupt`, which drops to the REPL.
 
@@ -114,8 +120,11 @@ feeds the watchdog* — see calls scattered through `ensure_data_file()`, `clear
 `find_latest_record()`, `stream_graph()`, `stream_table()`, `stream_events()`, `send_all()`,
 `connect_wifi()`, `capture_raw()`, `file_sha256()` and the update receiver. When adding any new
 loop that does I/O or iterates over many ring-buffer slots, thread `service_sampling()` calls
-through it the same way. Otherwise sampling cadence degrades and, during an update trial, a
-gap over ~8 s triggers a watchdog reset that counts as a failed boot.
+through it the same way. Otherwise sampling cadence degrades, and whenever the watchdog is armed
+(update trial or `watchdog_enabled`) a gap over ~8 s triggers a reset. During a trial, that
+reset also counts as a failed boot. Blocking calls without a loop (e.g. DNS in `sync_ntp()`)
+need to stay well under 8 s, which is why `ntp_server` should be an IP address when the
+watchdog is on.
 
 ### Over-the-air updates
 
@@ -129,7 +138,9 @@ updates disabled). `app.py` (`receive_update` → `stage_package`) streams the b
 an update is `pending`. It then writes `<name>.new` files after per-file hash checks, writes
 `update_ready.json`, replies and reboots; `main.py` does the rest. `check_update_commit()`
 confirms a pending update once the loop has run `UPDATE_COMMIT_MS` with the web server up, then
-resets once to release the watchdog (which cannot be stopped once armed). `main.py` keeps
+resets once to release the watchdog (which cannot be stopped once armed). It skips that reset
+when `PERMANENT_WATCHDOG` (captured from `CONFIG` at import, matching what `main.py` read at
+boot) keeps the watchdog armed anyway. `main.py` keeps
 `.deploy-manifest.json` in step with files changed over the air, so `deploy.py` stays accurate.
 
 ### Binary ring buffer (`voltage.bin`)

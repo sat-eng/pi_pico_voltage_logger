@@ -21,6 +21,10 @@ DEFAULTS = {
     "device_name": "Pico-Voltage-Logger",
     "ble_enabled": True,
     "localecho": True,
+    # Arm the hardware watchdog on every boot (hang protection for an
+    # unattended unit). Off by default: it resets the board ~8 s after a USB
+    # REPL/mpremote session stops the program.
+    "watchdog_enabled": False,
     # Shared secret for signed over-the-air updates; empty disables them.
     "update_key": ""
 }
@@ -43,6 +47,7 @@ def validate(cfg):
     out["device_name"] = str(out["device_name"])[:24]
     out["ble_enabled"] = bool(out["ble_enabled"])
     out["localecho"] = bool(out["localecho"])
+    out["watchdog_enabled"] = bool(out["watchdog_enabled"])
     out["update_key"] = str(out["update_key"]).strip()[:128]
 
     out["sample_interval_ms"] = max(1, int(out["sample_interval_ms"]))
