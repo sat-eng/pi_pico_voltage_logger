@@ -79,11 +79,18 @@ under CPython with stubbed `machine`/`time` modules.
   (`config_command`), Wi-Fi connection management, the over-the-air update receiver, and a
   hand-rolled HTTP server (raw sockets, no `uasyncio`/framework) that serves an inlined
   HTML+JS+Chart.js single-page UI, a calibration page (`/calibrate`), an update page (`/update`),
-  shared assets (`/ui.css`, `/ui.js`), and a JSON API: `/api/data` (10 s poll), `/api/live` (1 s instant reading + raw ADC),
-  `/api/raw` (2000-sample average for calibration), `/api/calibration` (GET/POST),
-  `/api/calibration/reset`, `/api/clear` (POST), `/api/update/status` (GET) and `/api/update`
-  (POST, raw package body). Small POST parameters go in the query string; only `/api/update`
-  reads a request body (via the `Content-Length` that `parse_request` returns). The bottom of the
+  a settings page (`/settings`), shared assets (`/ui.css`, `/ui.js`), and a JSON API:
+  `/api/data` (10 s poll), `/api/live` (1 s instant reading + raw ADC), `/api/raw`
+  (2000-sample average for calibration), `/api/calibration` (GET/POST),
+  `/api/calibration/reset`, `/api/clear` (POST), `/api/update/status` (GET), `/api/update`
+  (POST, raw package body), `/api/config` (GET; POST a JSON body of changed settings, optional
+  `"_restart": true`) and `/api/restart` (POST). `/api/config` never exposes `update_key`
+  (`WEB_HIDDEN_KEYS`: it authorises firmware updates and the server has no login) and treats
+  `wifi_password` as write-only (`WEB_SECRET_KEYS`: GET returns `wifi_password_set`; a blank value
+  keeps the current one). `apply_settings()` type-checks against the current `CONFIG` types,
+  runs `validate()` and reports keys it clamped. Small POST parameters go in the query string;
+  only `/api/update` and `/api/config` read a request body (via the `Content-Length` that
+  `parse_request` returns; `read_body()` caps the size). The bottom of the
   file has an `if __name__ == "__main__"` guard: `main.py` imports it and calls `main()`.
 
 - **`config_manager.py`** — the single source of truth for configuration shape. `DEFAULTS` is
@@ -93,6 +100,10 @@ under CPython with stubbed `machine`/`time` modules.
   atomic rename, hence the fallback restore-from-`.bak` on failure). Any new config key must be
   added to `DEFAULTS` *and* given validation/coercion logic in `validate()`, or `set`/`save` will
   silently ignore or mis-type it (this is why `localecho` was once dropped on every `save`).
+  `validate()` also caps `history_seconds` at `MAX_HISTORY_RECORDS` (20,000) records, because the
+  history file is created at full size, and replaces non-finite thresholds with defaults. A new
+  key also needs an entry in the Settings page's field list (`F` in `SETTINGS_HTML`) if it should
+  be editable on the web.
 
 - **`ble_console.py`** — a minimal Nordic UART Service (NUS) BLE terminal, framework-free
   (direct `bluetooth` module IRQ handling). It is transport-only: line framing (handles CR, LF,
@@ -179,9 +190,10 @@ don't replace this with a timezone library call, none is available on-device.
 Hand-rolled over raw `socket`, not a framework. Requests are parsed minimally (`parse_request`
 reads the request line and skips headers, keeping only `Content-Length`). Responses are streamed
 in small chunks via `send_all()`/`send_headers()` rather than building full strings in memory,
-for the same low-RAM reason as the ring buffer. The web UI lives in string constants in `app.py`: `HTML`
-(dashboard), `CAL_HTML` (calibration) and `UPDATE_HTML` (firmware update), plus `UI_CSS` and
-`UI_JS`, which all pages share via `/ui.css` and `/ui.js`. `UI_JS` builds the header, the
+for the same low-RAM reason as the ring buffer. The web UI lives in string constants in
+`app.py`: `HTML` (dashboard), `CAL_HTML` (calibration), `UPDATE_HTML` (firmware update) and
+`SETTINGS_HTML`, plus `UI_CSS` and `UI_JS`, which all pages share via `/ui.css` and `/ui.js`.
+`UI_JS` builds the header, the
 slide-out menu (including "Clear stored data") and toasts; pages set
 `<body data-page=… data-title=…>` and call `ui.setStatus()`/`ui.toast()`. Colours are CSS custom
 properties with a `prefers-color-scheme: dark` set; the dashboard's Chart.js colours are read from

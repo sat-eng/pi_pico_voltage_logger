@@ -1412,6 +1412,78 @@ def watchdog_status():
 
 
 # ============================================================
+# Settings (web page)
+# ============================================================
+
+# update_key is never exposed on the web: it authorises firmware updates,
+# and the web server has no login. The Wi-Fi password is write-only.
+WEB_HIDDEN_KEYS = ("update_key",)
+WEB_SECRET_KEYS = ("wifi_password",)
+MAX_SETTINGS_BODY = 2048
+
+
+def settings_json():
+    out = {}
+    for key, value in CONFIG.items():
+        if key in WEB_HIDDEN_KEYS:
+            continue
+        if key in WEB_SECRET_KEYS:
+            out[key + "_set"] = bool(value)
+        else:
+            out[key] = value
+    return json.dumps(out)
+
+
+def read_body(client, length, limit):
+    if length <= 0 or length > limit:
+        raise ValueError("request body must be 1..{} bytes".format(limit))
+    chunks = []
+    remaining = length
+    while remaining > 0:
+        chunk = client.recv(min(512, remaining))
+        if not chunk:
+            raise ValueError("connection closed")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+        service_sampling()
+    return b"".join(chunks)
+
+
+def apply_settings(changes):
+    # Validate and save changed settings; returns the keys whose values
+    # validate() adjusted (clamped or rounded). Most settings are read at
+    # startup, so they take effect after a restart.
+    global CONFIG
+    if not isinstance(changes, dict) or not changes:
+        raise ValueError("no settings given")
+    candidate = {k: v for k, v in CONFIG.items()}
+    for key, value in changes.items():
+        if key not in CONFIG or key in WEB_HIDDEN_KEYS:
+            raise ValueError("unknown setting: {}".format(key))
+        if key in WEB_SECRET_KEYS and value == "":
+            continue                    # blank keeps the current value
+        current = CONFIG[key]
+        try:
+            if isinstance(current, bool):
+                if not isinstance(value, bool):
+                    raise ValueError()
+            elif isinstance(current, int):
+                value = int(value)
+            elif isinstance(current, float):
+                value = float(value)
+            else:
+                value = str(value)
+        except (ValueError, TypeError):
+            raise ValueError("invalid value for {}".format(key))
+        candidate[key] = value
+    validated = validate_config(candidate)
+    adjusted = [k for k in changes if k not in WEB_SECRET_KEYS
+                and validated.get(k) != candidate.get(k)]
+    CONFIG = save_config(validated)
+    return adjusted
+
+
+# ============================================================
 # Web page
 # ============================================================
 
@@ -1945,8 +2017,19 @@ code{font-size:.9em;word-break:break-all}
 .kv{width:auto}
 .kv td{text-align:left;padding:6px 14px 6px 0;border:0}
 .kv td:first-child{color:var(--ink-2)}
+.form{display:grid;grid-template-columns:minmax(150px,230px) minmax(0,1fr);gap:12px 18px;align-items:start}
+.form>label{padding-top:7px;font-size:.9rem;color:var(--ink-2)}
+.field input[type=text],.field input[type=password]{width:100%;max-width:340px}
+.field input[type=number]{width:9em}
+.field .hint{margin-top:4px;font-size:.8rem;color:var(--muted)}
+.field .warn{margin-top:4px;font-size:.8rem;color:var(--crit)}
+.field.changed input{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
+.switch{display:inline-flex;align-items:center;gap:8px;padding-top:6px;color:var(--ink)}
+.switch input{width:18px;height:18px;accent-color:var(--accent)}
+.savebar{position:sticky;bottom:12px;z-index:10;display:flex;flex-wrap:wrap;gap:10px;align-items:center;justify-content:space-between;box-shadow:0 6px 24px rgba(16,24,40,.18)}
 .toast{position:fixed;left:50%;bottom:22px;z-index:50;max-width:calc(100% - 32px);padding:10px 16px;border-radius:10px;background:var(--ink);color:var(--surface);box-shadow:var(--shadow);transform:translateX(-50%);opacity:0;pointer-events:none;transition:opacity .2s}
 .toast.show{opacity:1}
+@media (max-width:600px){.form{grid-template-columns:minmax(0,1fr);gap:4px}.form>label{padding-top:10px}}
 @media (max-width:900px){.grid2{grid-template-columns:minmax(0,1fr)}}
 @media (max-width:520px){.tile.hero,.tile.wide{grid-column:1/-1}.seg button{padding:6px 7px}#chartWrap{height:260px}}
 '''
@@ -1963,6 +2046,7 @@ const I={
   chart:svg('<path d="M3 3v18h18"/><path d="M7 15l4-4 3 3 5-6"/>'),
   cal:svg('<path d="M12 3v3M12 18v3M3 12h3M18 12h3"/><circle cx="12" cy="12" r="5"/>'),
   up:svg('<path d="M12 16V4M7 9l5-5 5 5"/><path d="M4 20h16"/>'),
+  gear:svg('<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/>'),
   trash:svg('<path d="M4 7h16M10 11v6M14 11v6"/><path d="M6 7l1 13h10l1-13M9 7V4h6v3"/>')
 };
 const link=(href,id,icon,text)=>'<a href="'+href+'"'+(page===id?' class="current" aria-current="page"':'')+'>'+icon+text+'</a>';
@@ -1979,7 +2063,7 @@ dr.className='drawer';dr.id='drawer';dr.setAttribute('aria-label','Menu');
 dr.innerHTML='<div class="drawer-head"><span>Pico Voltage Logger</span>'+
   '<button class="icon-btn" id="menuClose" aria-label="Close menu">'+I.close+'</button></div>'+
   '<nav>'+link('/','dashboard',I.chart,'Dashboard')+link('/calibrate','calibrate',I.cal,'Calibrate ADC')+
-  link('/update','update',I.up,'Firmware update')+'<hr>'+
+  link('/update','update',I.up,'Firmware update')+link('/settings','settings',I.gear,'Settings')+'<hr>'+
   '<button class="item danger" id="clearBtn">'+I.trash+'Clear stored data</button></nav>'+
   '<div class="foot">24-hour voltage logger</div>';
 const scrim=document.createElement('div');scrim.className='scrim';
@@ -2116,6 +2200,180 @@ loadStatus();
 '''
 
 
+SETTINGS_HTML = r'''<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Settings - Pico Voltage Logger</title>
+<link rel="stylesheet" href="/ui.css">
+</head>
+<body data-page="settings" data-title="Settings">
+<main>
+<div id="groups"><div class="card"><div class="empty">Loading settings...</div></div></div>
+<div class="card savebar">
+  <span class="small" id="dirty">No unsaved changes.</span>
+  <div class="row">
+    <button class="btn" id="discardBtn" onclick="discard()" disabled>Discard</button>
+    <button class="btn" id="saveBtn" onclick="save(false)" disabled>Save</button>
+    <button class="btn primary" id="saveRestartBtn" onclick="save(true)" disabled>Save and restart</button>
+    <button class="btn" onclick="restartOnly()">Restart device</button>
+  </div>
+</div>
+</main>
+
+<script src="/ui.js"></script>
+<script>
+// [key, label, type, options]; a one-element entry starts a group.
+const F=[
+ ['Network'],
+ ['wifi_ssid','Wi-Fi network (SSID)','text',{}],
+ ['wifi_password','Wi-Fi password','password',{hint:'Leave blank to keep the current password.'}],
+ ['http_port','Web server port','int',{min:1,max:65535,warn:'After restarting, the page moves to the new port.'}],
+ ['Time'],
+ ['ntp_server','NTP server','text',{hint:'An IP address avoids DNS delays (needed with the watchdog on).'}],
+ ['ntp_resync_seconds','Clock resync interval','int',{min:60,unit:'s',dur:1}],
+ ['Logging'],
+ ['sample_interval_ms','Sample interval','int',{min:1,unit:'ms'}],
+ ['record_interval_ms','Record interval','int',{min:1000,step:1000,unit:'ms',
+   warn:'Changing this erases stored history at restart.'}],
+ ['history_seconds','History length','int',{min:60,unit:'s',dur:1,
+   hint:'At most 20,000 records.',warn:'Changing this erases stored history at restart.'}],
+ ['Events'],
+ ['event_low_voltage','Low-voltage threshold','float',{step:0.01,unit:'V'}],
+ ['event_drop_volts','Excursion threshold','float',{min:0,step:0.01,unit:'V'}],
+ ['max_events','Events listed','int',{min:1,max:500}],
+ ['Display'],
+ ['max_table_rows','Measurement table rows','int',{min:10,max:500}],
+ ['max_graph_points','Chart points','int',{min:60,max:1440}],
+ ['Device'],
+ ['device_name','BLE device name','text',{maxlength:24}],
+ ['ble_enabled','BLE console','bool',{warn:'With BLE off there is no fallback if Wi-Fi fails.'}],
+ ['localecho','BLE command echo','bool',{}],
+ ['watchdog_enabled','Permanent watchdog','bool',{warn:'While on, USB/mpremote sessions are reset after about 8 s.'}]
+];
+const META={};F.forEach(f=>{if(f.length>1)META[f[0]]=f;});
+let original={};
+
+function dur(s){s=Number(s);if(!(s>0))return '';
+  return s>=3600?'= '+(s/3600).toFixed(s%3600?1:0)+' h':s>=60?'= '+(s/60).toFixed(s%60?1:0)+' min':'';}
+function esc(v){return String(v).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;');}
+
+function render(cfg){
+  let h='',open=false;
+  F.forEach(f=>{
+    if(f.length===1){if(open)h+='</div></div>';h+='<div class="card"><h2>'+f[0]+'</h2><div class="form">';open=true;return;}
+    const [k,label,type,o]=f, id='f_'+k;
+    let input;
+    if(type==='bool')input='<label class="switch"><input type="checkbox" id="'+id+'"'+(cfg[k]?' checked':'')+'> On</label>';
+    else if(type==='password')input='<input type="password" id="'+id+'" autocomplete="new-password" placeholder="'+
+      (cfg.wifi_password_set?'unchanged':'not set')+'">';
+    else input='<input type="'+(type==='text'?'text':'number')+'" id="'+id+'" value="'+esc(cfg[k])+'"'+
+      (o.min!==undefined?' min="'+o.min+'"':'')+(o.max!==undefined?' max="'+o.max+'"':'')+
+      ' step="'+(o.step||(type==='float'?'any':1))+'"'+(o.maxlength?' maxlength="'+o.maxlength+'"':'')+'>'+
+      (o.unit?'<span class="unit">'+o.unit+'</span>':'')+(o.dur?'<span class="small" id="d_'+k+'"> '+dur(cfg[k])+'</span>':'');
+    h+='<label for="'+id+'">'+label+'</label><div class="field" id="r_'+k+'">'+input+
+      (o.hint?'<div class="hint">'+o.hint+'</div>':'')+(o.warn?'<div class="warn" hidden>⚠ '+o.warn+'</div>':'')+'</div>';
+  });
+  h+='</div></div>';
+  document.getElementById('groups').innerHTML=h;
+  document.querySelectorAll('#groups input').forEach(i=>i.addEventListener('input',update));
+}
+
+function value(k){
+  const el=document.getElementById('f_'+k), t=META[k][2];
+  if(t==='bool')return el.checked;
+  if(t==='int')return el.value===''?NaN:Math.round(Number(el.value));
+  if(t==='float')return el.value===''?NaN:Number(el.value);
+  return el.value;
+}
+
+function changes(){
+  const c={};
+  Object.keys(META).forEach(k=>{
+    const v=value(k);
+    if(META[k][2]==='password'){if(v!=='')c[k]=v;}
+    else if(v!==original[k])c[k]=v;
+  });
+  return c;
+}
+
+function update(){
+  const c=changes(), n=Object.keys(c).length;
+  Object.keys(META).forEach(k=>{
+    const row=document.getElementById('r_'+k), w=row.querySelector('.warn');
+    row.classList.toggle('changed',k in c);
+    if(w)w.hidden=!(k in c);
+    const d=document.getElementById('d_'+k); if(d)d.textContent=' '+dur(value(k));
+  });
+  document.getElementById('dirty').textContent=n?n+' unsaved change'+(n>1?'s':'')+'.':'No unsaved changes.';
+  ['discardBtn','saveBtn','saveRestartBtn'].forEach(id=>document.getElementById(id).disabled=!n);
+}
+
+async function load(){
+  try{
+    const r=await fetch('/api/config',{cache:'no-store'});
+    if(!r.ok)throw new Error('HTTP '+r.status);
+    original=await r.json();
+    render(original);update();
+  }catch(e){document.getElementById('groups').innerHTML=
+    '<div class="card"><div class="empty">Could not load settings: '+e.message+'</div></div>';}
+}
+
+function discard(){render(original);update();}
+
+async function save(restart){
+  const c=changes();
+  for(const k in c){
+    const t=META[k][2];
+    if((t==='int'||t==='float')&&!isFinite(c[k])){ui.toast(META[k][1]+' needs a number');return;}
+  }
+  const warns=Object.keys(c).filter(k=>META[k][3].warn).map(k=>'• '+META[k][1]+': '+META[k][3].warn);
+  const msg=(restart?'Save and restart the logger?':'Save these settings? They take effect at the next restart.')+
+    (warns.length?'\n\n'+warns.join('\n'):'');
+  if(!confirm(msg))return;
+  if(restart)c._restart=true;
+  try{
+    const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(c)});
+    const d=await r.json();
+    if(!d.ok)throw new Error(d.error||('HTTP '+r.status));
+    if(d.adjusted.length)ui.toast('Saved. Adjusted to valid values: '+d.adjusted.map(k=>META[k]?META[k][1]:k).join(', '));
+    else ui.toast(restart?'Saved; restarting...':'Saved. Restart to apply.');
+    if(restart)waitForRestart(c.http_port||null);
+    else load();
+  }catch(e){ui.toast('Save failed: '+e.message);}
+}
+
+async function restartOnly(){
+  if(!confirm('Restart the logger now? It is unavailable for about 20 seconds.'))return;
+  try{await fetch('/api/restart',{method:'POST'});ui.toast('Restarting...');waitForRestart(null);}
+  catch(e){ui.toast('Restart failed: '+e.message);}
+}
+
+function waitForRestart(newPort){
+  document.querySelectorAll('.savebar button').forEach(b=>b.disabled=true);
+  const dirty=document.getElementById('dirty');
+  if(newPort&&String(newPort)!==(location.port||'80')){
+    const url=location.protocol+'//'+location.hostname+(newPort==80?'':':'+newPort)+'/settings';
+    dirty.innerHTML='Restarting. The logger will be at <a href="'+url+'">'+url+'</a>.';
+    return;
+  }
+  dirty.textContent='Restarting... waiting for the logger to come back.';
+  const start=Date.now();
+  setTimeout(function poll(){
+    fetch('/api/live',{cache:'no-store'}).then(r=>{if(r.ok)location.reload();else throw 0;})
+      .catch(()=>{if(Date.now()-start<120000)setTimeout(poll,3000);
+        else dirty.textContent='The logger has not come back after 2 minutes. Check it over BLE.';});
+  },6000);
+}
+
+load();
+</script>
+</body>
+</html>
+'''
+
+
 # Browsers cache /ui.css and /ui.js for a day (fewer requests to this
 # single-connection server). A content hash added to their URLs as pages are
 # sent makes browsers fetch new copies after an update. Hashing in small
@@ -2216,6 +2474,39 @@ def handle_client(client):
 
     elif path == "/update":
         send_page(client, UPDATE_HTML)
+
+    elif path == "/settings":
+        send_page(client, SETTINGS_HTML)
+
+    elif path == "/api/config" and method == "GET":
+        send_headers(client)
+        send_all(client, settings_json())
+
+    elif path == "/api/config" and method == "POST":
+        try:
+            changes = json.loads(read_body(client, length,
+                                           MAX_SETTINGS_BODY).decode())
+            restart = isinstance(changes, dict) and \
+                changes.pop("_restart", False) is True
+            adjusted = apply_settings(changes)
+        except Exception as e:
+            print("Settings rejected:", e)
+            send_headers(client, status="400 Bad Request")
+            send_all(client, '{{"ok":false,"error":{}}}'.format(
+                json_string(e)))
+        else:
+            # Log which settings changed, never their values.
+            print("Settings saved:", ", ".join(sorted(changes)))
+            send_headers(client)
+            send_all(client, json.dumps(
+                {"ok": True, "adjusted": adjusted, "restart": restart}))
+            reboot_requested = restart
+
+    elif path == "/api/restart" and method == "POST":
+        print("Restart requested from the web page")
+        send_headers(client)
+        send_all(client, '{"ok":true}')
+        reboot_requested = True
 
     elif path == "/ui.css":
         send_page(client, UI_CSS, "text/css; charset=utf-8", max_age=86400)
@@ -2422,7 +2713,8 @@ def main(watchdog=None):
                 gc.collect()
 
             if reboot_requested:
-                # A verified update is staged; main.py applies it at boot.
+                # After a staged update (main.py applies it at boot) or a
+                # restart requested from the Settings page.
                 time.sleep_ms(500)
                 machine.reset()
 

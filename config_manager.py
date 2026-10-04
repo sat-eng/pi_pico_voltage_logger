@@ -30,6 +30,16 @@ DEFAULTS = {
 }
 
 
+MAX_HISTORY_RECORDS = 20000
+
+
+def _finite(value, fallback):
+    value = float(value)
+    if value != value or value in (float("inf"), float("-inf")):
+        return float(fallback)
+    return value
+
+
 def _copy_defaults():
     return {k: v for k, v in DEFAULTS.items()}
 
@@ -54,15 +64,21 @@ def validate(cfg):
     out["record_interval_ms"] = max(1000, int(out["record_interval_ms"]))
     # Ring indexing works in whole seconds.
     out["record_interval_ms"] = (out["record_interval_ms"] // 1000) * 1000
-    out["history_seconds"] = max(out["record_interval_ms"] // 1000,
-                                 int(out["history_seconds"]))
+    # The history file is created at full size, so cap it (240 KB) to
+    # stay well inside the Pico's flash.
+    record_seconds = out["record_interval_ms"] // 1000
+    out["history_seconds"] = min(record_seconds * MAX_HISTORY_RECORDS,
+                                 max(record_seconds,
+                                     int(out["history_seconds"])))
     out["ntp_resync_seconds"] = max(60, int(out["ntp_resync_seconds"]))
     out["http_port"] = min(65535, max(1, int(out["http_port"])))
     out["max_events"] = min(500, max(1, int(out["max_events"])))
     out["max_table_rows"] = min(500, max(10, int(out["max_table_rows"])))
     out["max_graph_points"] = min(1440, max(60, int(out["max_graph_points"])))
-    out["event_low_voltage"] = float(out["event_low_voltage"])
-    out["event_drop_volts"] = max(0.0, float(out["event_drop_volts"]))
+    out["event_low_voltage"] = _finite(out["event_low_voltage"],
+                                       DEFAULTS["event_low_voltage"])
+    out["event_drop_volts"] = max(0.0, _finite(out["event_drop_volts"],
+                                               DEFAULTS["event_drop_volts"]))
     return out
 
 

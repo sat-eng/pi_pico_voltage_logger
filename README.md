@@ -479,12 +479,36 @@ The header shows the logger's status (logging, waiting for NTP, or
 connection lost) and the current time. The menu button at the top left
 opens a side menu with **Dashboard**, **Calibrate ADC** (see
 [Calibrating from the web interface](#calibrating-from-the-web-interface)),
-**Firmware update** (see [Over-the-Air Updates](#over-the-air-updates))
-and **Clear stored data**, which asks for confirmation before erasing
-the history.
+**Firmware update** (see [Over-the-Air Updates](#over-the-air-updates)),
+**Settings** (see below) and **Clear stored data**, which asks for
+confirmation before erasing the history.
 
 The pages follow the light or dark setting of your phone or computer
 and adapt to phone screens.
+
+### Settings page
+
+**Settings** edits the configuration in `config.json`, grouped as
+Network, Time, Logging, Events, Display and Device. Changed fields are
+highlighted, and you can **Save** (applied at the next restart), **Save
+and restart**, or **Restart device** without changes. Out-of-range values
+are adjusted to the nearest valid value, and the page tells you which.
+
+Some changes warn you and ask for confirmation first:
+
+-   Changing the **record interval** or **history length** erases stored
+    history at restart, because the history file is resized. History is
+    capped at 20,000 records (240 KB of flash).
+-   Changing the **web server port** moves the page to the new port.
+-   Turning **BLE off** removes the fallback if Wi-Fi fails.
+-   Turning on the **permanent watchdog** affects USB sessions (see
+    [Permanent watchdog](#permanent-watchdog-optional)).
+
+The web server has no login, so two settings are protected:
+-   The **Wi-Fi password** is write-only. It is never shown, and leaving
+    the field blank keeps the current one.
+-   **`update_key`** is not available on the web page at all, because
+    it authorises firmware updates. Set it over BLE.
 
 The chart uses Chart.js, which loads from the internet. Without internet
 access the dashboard says so, and the readings, events and measurements
