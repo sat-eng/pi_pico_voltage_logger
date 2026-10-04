@@ -28,16 +28,16 @@ mpremote connect /dev/cu.usbmodemXXXX fs cp config.json :config.json
 mpremote connect /dev/cu.usbmodemXXXX reset
 ```
 
-For USB updates, use `./deploy.py`. It finds the board holding this project's
+For USB updates, use `tools/deploy.py`. It finds the board holding this project's
 `.deploy-manifest.json` (SHA-256 per managed file), copies only changed files from
 `MANAGED_FILES`, rewrites the manifest, clears over-the-air backups/staging (`CLEAR_OTA_STATE`)
 and hard-resets the board. Run `--init --port <port>` once per board; `--dry-run`, `--force` and
-`--list` are also available. When adding a new firmware file, add it to `MANAGED_FILES` in
-`deploy.py`, and if it should be updatable over the air, to `UPDATABLE_FILES` in `app.py`,
-`main.py` and `make_package.py`, and to the file tuple in `deploy.py`'s `CLEAR_OTA_STATE`
-(all four must agree).
+`--list` are also available. When adding a new firmware file, put it at the top level (never
+in `tools/`) and add it to `MANAGED_FILES` in `tools/deploy.py`. If it should be updatable over
+the air, also add it to `UPDATABLE_FILES` in `app.py`, `main.py` and `tools/make_package.py`, and
+to the file tuple in `tools/deploy.py`'s `CLEAR_OTA_STATE` (all four must agree).
 
-For over-the-air updates, use `./make_package.py --device http://<ip> --upload` (see
+For over-the-air updates, use `tools/make_package.py --device http://<ip> --upload` (see
 "Over-the-air updates" below).
 
 The device's own `config.json` (real Wi-Fi credentials, `update_key`) and `calibration.data`
@@ -113,8 +113,13 @@ under CPython with stubbed `machine`/`time` modules.
   It calls back into `app.py` via injected `line_handler`/`connect_handler`/`echo_handler`
   functions — it has no knowledge of what commands mean.
 
-- **`deploy.py`** / **`make_package.py`** — host-side tools (CPython): USB updater and
-  over-the-air package builder/uploader. On macOS, Local Network privacy can block Python's
+- **`tools/`** — host-side tools (CPython), kept out of the top level so they're never
+  mistaken for firmware: everything at the top level goes on the Pico, nothing in `tools/` does.
+  `deploy.py` (USB updater), `make_package.py` (over-the-air package builder/uploader) and
+  `ble_terminal.py` (interactive NUS console over `bleak`; writes 20-byte chunks because the
+  logger's RX characteristic holds 20 bytes and a 500 ms gap ends a command; filters the
+  logger's `localecho` echo). The tools use `REPO` (the parent of `tools/`) for firmware files,
+  `.update-key`, `.deploy-device` and `dist/`. On macOS, Local Network privacy can block Python's
   HTTP to the LAN (errno 65) while the system `curl` is allowed, so `make_package.py` falls
   back to `curl` in that case.
 

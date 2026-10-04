@@ -20,11 +20,11 @@ config.json and calibration.data are live device state and are never
 overwritten. On --init, config.json is copied only if the device has none.
 
 Usage:
-  ./deploy.py                  deploy changed files
-  ./deploy.py --dry-run        show what would change (board still restarts)
-  ./deploy.py --force          copy every managed file
-  ./deploy.py --list           list connected boards (touches no board)
-  ./deploy.py --init --port /dev/cu.usbmodemXXXX
+  tools/deploy.py              deploy changed files
+  tools/deploy.py --dry-run    show what would change (board still restarts)
+  tools/deploy.py --force      copy every managed file
+  tools/deploy.py --list       list connected boards (touches no board)
+  tools/deploy.py --init --port /dev/cu.usbmodemXXXX
                                first deployment to a board with no manifest
 """
 
@@ -63,7 +63,9 @@ with open('update_state.json', 'w') as f:
     json.dump({'state': 'usb_deployed', 'last_created': last}, f)
 """
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+# Repository root: the firmware files, key and caches live there; this
+# script lives in tools/.
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def fail(msg):
@@ -123,14 +125,14 @@ def reset(mpremote, port):
 
 def load_cache():
     try:
-        with open(os.path.join(HERE, DEVICE_CACHE)) as f:
+        with open(os.path.join(REPO, DEVICE_CACHE)) as f:
             return json.load(f).get("serial")
     except (OSError, ValueError):
         return None
 
 
 def save_cache(serial):
-    with open(os.path.join(HERE, DEVICE_CACHE), "w") as f:
+    with open(os.path.join(REPO, DEVICE_CACHE), "w") as f:
         json.dump({"serial": serial}, f)
         f.write("\n")
 
@@ -161,7 +163,7 @@ def find_device(mpremote):
             reset(mpremote, b["port"])
     if found is None:
         fail("no board has a {} manifest. For a first deployment run:\n"
-             "  ./deploy.py --init --port <port>".format(PROJECT))
+             "  tools/deploy.py --init --port <port>".format(PROJECT))
     save_cache(found[0]["serial"])
     return found[0]["port"], found[1]
 
@@ -177,7 +179,7 @@ def sha256(path):
 def local_hashes():
     hashes = {}
     for name in MANAGED_FILES:
-        path = os.path.join(HERE, name)
+        path = os.path.join(REPO, name)
         if not os.path.isfile(path):
             fail("managed file missing locally: " + name)
         hashes[name] = sha256(path)
@@ -249,12 +251,12 @@ def main():
 
     cmd = ["connect", port]
     for name in changed:
-        cmd += ["fs", "cp", os.path.join(HERE, name), ":" + name, "+"]
+        cmd += ["fs", "cp", os.path.join(REPO, name), ":" + name, "+"]
     if args.init:
         for name in INIT_ONLY_IF_MISSING:
             if not device_has_file(mpremote, port, name):
                 print("  init:    ", name, "(device had none)")
-                cmd += ["fs", "cp", os.path.join(HERE, name), ":" + name, "+"]
+                cmd += ["fs", "cp", os.path.join(REPO, name), ":" + name, "+"]
 
     # Record only what has been copied: the manifest goes last, so a
     # failed copy leaves the old hashes and the file is retried next run.

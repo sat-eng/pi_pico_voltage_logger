@@ -7,16 +7,16 @@ It is signed with HMAC-SHA256 using the key in .update-key, which must
 match the device's update_key setting.
 
 Usage:
-  ./make_package.py --gen-key
+  tools/make_package.py --gen-key
         create .update-key and print the BLE commands to install it
 
-  ./make_package.py
+  tools/make_package.py
         package all updatable files into dist/
 
-  ./make_package.py --device http://192.168.0.102
+  tools/make_package.py --device http://192.168.0.102
         package only the files that differ from what the device runs
 
-  ./make_package.py --device http://192.168.0.102 --upload
+  tools/make_package.py --device http://192.168.0.102 --upload
         ...and upload it, then wait for the device to confirm or roll back
 
 The resulting .pvlpkg file can also be uploaded from the device's
@@ -36,10 +36,12 @@ import time
 import urllib.error
 import urllib.request
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+# Repository root: the firmware files, key and caches live there; this
+# script lives in tools/.
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 UPDATABLE_FILES = ["app.py", "ble_console.py", "config_manager.py"]
 MAGIC = b"PVLPKG1"
-KEY_FILE = os.path.join(HERE, ".update-key")
+KEY_FILE = os.path.join(REPO, ".update-key")
 MAX_PACKAGE_BYTES = 256 * 1024     # must match app.py
 
 
@@ -74,9 +76,9 @@ def gen_key(path):
 
 def git_version():
     try:
-        rev = subprocess.run(["git", "-C", HERE, "rev-parse", "--short", "HEAD"],
+        rev = subprocess.run(["git", "-C", REPO, "rev-parse", "--short", "HEAD"],
                              capture_output=True, text=True, check=True).stdout.strip()
-        dirty = subprocess.run(["git", "-C", HERE, "status", "--porcelain",
+        dirty = subprocess.run(["git", "-C", REPO, "status", "--porcelain",
                                 "--"] + UPDATABLE_FILES,
                                capture_output=True, text=True).stdout.strip()
         return rev + ("-dirty" if dirty else "")
@@ -170,7 +172,7 @@ def main():
     p.add_argument("--device", help="logger URL, e.g. http://192.168.0.102; "
                    "package only files that differ from the device")
     p.add_argument("--upload", action="store_true", help="upload to --device and wait")
-    p.add_argument("--src", default=HERE, help="directory to take files from")
+    p.add_argument("--src", default=REPO, help="directory to take files from")
     p.add_argument("--out", help="output file (default dist/update-<version>.pvlpkg)")
     p.add_argument("--version", help="version label (default: git revision)")
     p.add_argument("--key-file", default=KEY_FILE)
@@ -214,7 +216,7 @@ def main():
         fail("package is {} bytes; the device accepts at most {}".format(
             len(package), MAX_PACKAGE_BYTES))
 
-    out = args.out or os.path.join(HERE, "dist", "update-{}.pvlpkg".format(version))
+    out = args.out or os.path.join(REPO, "dist", "update-{}.pvlpkg".format(version))
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
     with open(out, "wb") as f:
         f.write(package)

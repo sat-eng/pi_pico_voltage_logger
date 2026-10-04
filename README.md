@@ -38,6 +38,10 @@ when an appropriate input divider and protection circuit are used.
 
 ## Files
 
+Everything at the top level is firmware that goes on the Pico. The
+`tools/` folder holds programs that run on your computer and never go
+on the Pico.
+
   -----------------------------------------------------------------------
   File                                Purpose
   ----------------------------------- -----------------------------------
@@ -59,11 +63,13 @@ when an appropriate input divider and protection circuit are used.
 
   `config.json`                       User configuration
 
-  `deploy.py`                         USB updater: copies changed files
+  `tools/deploy.py`                   USB updater: copies changed files
                                       to the Pico and restarts it
 
-  `make_package.py`                   Builds signed over-the-air update
+  `tools/make_package.py`             Builds signed over-the-air update
                                       packages
+
+  `tools/ble_terminal.py`             Terminal for the BLE console
 
   `calibration.data`                  ADC calibration (slope/offset).
                                       Created on the device at first
@@ -213,8 +219,8 @@ and `calibration.data` holds its calibration. Use `deploy.py` to update
 the code without overwriting either:
 
 ``` bash
-./deploy.py --init --port /dev/cu.usbmodem1451201   # once per board
-./deploy.py                                         # every update after that
+tools/deploy.py --init --port /dev/cu.usbmodem1451201   # once per board
+tools/deploy.py                                         # every update after that
 ```
 
 The device stores a manifest (`.deploy-manifest.json`) with the SHA-256
@@ -252,12 +258,12 @@ update can always be undone.
 
 ### One-time setup (over USB, before installing the logger)
 
-1.  Deploy the current firmware with `./deploy.py`. This installs the
+1.  Deploy the current firmware with `tools/deploy.py`. This installs the
     bootstrap.
 2.  Create a signing key and install it on the logger:
 
     ``` bash
-    ./make_package.py --gen-key
+    tools/make_package.py --gen-key
     ```
 
     This writes `.update-key` (git-ignored; keep it private) and prints
@@ -270,12 +276,12 @@ update can always be undone.
 ### Sending an update
 
 ``` bash
-./make_package.py --device http://192.168.0.102 --upload
+tools/make_package.py --device http://192.168.0.102 --upload
 ```
 
 This asks the logger which files it runs, packages only the ones that
 differ, signs the package, uploads it and waits for the result. You can
-also build a package with `./make_package.py` (written to `dist/`) and
+also build a package with `tools/make_package.py` (written to `dist/`) and
 upload the `.pvlpkg` file from the **Firmware update** page linked from
 the main page.
 
@@ -391,7 +397,23 @@ TX:      6E400003-B5A3-F393-E0A9-E50E24DCCA9E
 ```
 
 This means it can be used with BLE terminal applications that support
-Nordic UART.
+Nordic UART, for example Adafruit's Bluefruit LE Connect (UART mode) on
+macOS, iOS or Android, or Nordic's nRF Toolbox on a phone.
+
+The repository also includes a command-line terminal:
+
+``` bash
+python3 -m pip install bleak          # once
+tools/ble_terminal.py                 # connect to Pico-Voltage-Logger
+tools/ble_terminal.py --scan          # list nearby devices
+tools/ble_terminal.py --name NAME     # if you changed device_name
+echo status | tools/ble_terminal.py   # run commands from a script
+```
+
+Type commands as usual and quit with Ctrl-D. The terminal hides the
+logger's echo of each command, since you can already see what you typed
+(`--show-echo` keeps it). On macOS, the first run asks you to allow
+Bluetooth for your terminal app.
 
 After connection the Pico waits briefly for the terminal to subscribe to
 notifications and then displays a welcome/status screen containing the
