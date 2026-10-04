@@ -4,6 +4,7 @@ import struct
 import time
 import os
 import gc
+import json
 import machine
 
 from machine import ADC, RTC
@@ -22,9 +23,19 @@ NTP_SERVER = CONFIG["ntp_server"]
 
 ADC_PIN = 26
 
-# Bench calibration remains firmware-specific rather than user configuration.
-CAL_SLOPE = 0.00050893
-CAL_OFFSET = -0.13633
+# Calibration lives in its own file so it can be redone from the web UI
+# without touching config.json. Vin = slope * read_u16 + offset.
+CAL_FILE = "calibration.data"
+CAL_TEMP_FILE = "calibration.tmp"
+
+# Original bench calibration, used only if calibration.data is missing
+# or unreadable (and written out to create the file on first boot).
+DEFAULT_CAL_SLOPE = 0.00050893
+DEFAULT_CAL_OFFSET = -0.13633
+
+CAL_SLOPE = DEFAULT_CAL_SLOPE
+CAL_OFFSET = DEFAULT_CAL_OFFSET
+CAL_SOURCE = "default"
 
 SAMPLE_INTERVAL_MS = CONFIG["sample_interval_ms"]
 RECORD_INTERVAL_MS = CONFIG["record_interval_ms"]
@@ -256,6 +267,104 @@ def service_sampling():
     # Called from file/HTTP loops so long requests continue sampling as
     # often as practical.
     sample_if_due()
+
+
+LIVE_BURST = 16
+
+
+def read_live_raw():
+    # Instantaneous reading for the web UI. A short burst average takes
+    # well under a millisecond and smooths ADC noise. It does not touch
+    # the logging accumulators, so recorded statistics are unaffected.
+    total = 0
+    for _ in range(LIVE_BURST):
+        total += adc.read_u16()
+    return total // LIVE_BURST
+
+
+# ============================================================
+# Calibration
+# ============================================================
+
+CAL_CAPTURE_SAMPLES = 2000
+
+
+def valid_calibration(slope, offset):
+    # Generous bounds: catch typos/garbage, not plausible hardware.
+    return 1e-6 < slope < 1e-2 and -5.0 < offset < 5.0
+
+
+def save_calibration(slope, offset):
+    # Same temp-file + .bak pattern as config_manager.save().
+    with open(CAL_TEMP_FILE, "w") as f:
+        f.write('{{"slope":{:.10g},"offset":{:.10g}}}'.format(slope, offset))
+    try:
+        os.remove(CAL_FILE + ".bak")
+    except OSError:
+        pass
+    try:
+        os.rename(CAL_FILE, CAL_FILE + ".bak")
+    except OSError:
+        pass
+    try:
+        os.rename(CAL_TEMP_FILE, CAL_FILE)
+    except Exception:
+        try:
+            os.rename(CAL_FILE + ".bak", CAL_FILE)
+        except OSError:
+            pass
+        raise
+    try:
+        os.remove(CAL_FILE + ".bak")
+    except OSError:
+        pass
+
+
+def apply_calibration(slope, offset, source):
+    global CAL_SLOPE, CAL_OFFSET, CAL_SOURCE
+    CAL_SLOPE = slope
+    CAL_OFFSET = offset
+    CAL_SOURCE = source
+
+
+def load_calibration():
+    try:
+        with open(CAL_FILE, "r") as f:
+            d = json.load(f)
+        slope = float(d["slope"])
+        offset = float(d["offset"])
+        if not valid_calibration(slope, offset):
+            raise ValueError("values out of range")
+        is_default = (slope == DEFAULT_CAL_SLOPE and
+                      offset == DEFAULT_CAL_OFFSET)
+        apply_calibration(slope, offset, "default" if is_default else "file")
+        print("Calibration loaded from", CAL_FILE)
+    except Exception as e:
+        print("Using default calibration:", e)
+        apply_calibration(DEFAULT_CAL_SLOPE, DEFAULT_CAL_OFFSET, "default")
+        try:
+            save_calibration(DEFAULT_CAL_SLOPE, DEFAULT_CAL_OFFSET)
+        except Exception as save_error:
+            print("Could not create", CAL_FILE + ":", save_error)
+    print("Calibration: slope={} offset={}".format(CAL_SLOPE, CAL_OFFSET))
+
+
+def capture_raw():
+    # Average many raw ADC reads for one calibration point. Keep the
+    # logger sampling while we do it.
+    total = 0
+    lo = 65535
+    hi = 0
+    for i in range(CAL_CAPTURE_SAMPLES):
+        raw = adc.read_u16()
+        total += raw
+        if raw < lo:
+            lo = raw
+        if raw > hi:
+            hi = raw
+        if (i & 63) == 0:
+            service_sampling()
+    return total / CAL_CAPTURE_SAMPLES, lo, hi
 
 
 # ============================================================
@@ -944,10 +1053,18 @@ thead th{position:sticky;top:0;background:white;z-index:1}
 .event-row{padding:8px;border-bottom:1px solid #ddd;cursor:pointer}
 .event-row:hover{background:#f0f0f0}
 .small{font-size:.9em;color:#555}
+.live{font-size:2.6em;font-weight:bold}
+.live.stale{color:#999}
 </style>
 </head>
 <body>
 <h1>Pico Voltage Logger</h1>
+
+<div class="card">
+  <h2>Live voltage</h2>
+  <div><span id="live" class="live stale">--</span> V</div>
+  <div class="small">Instantaneous reading, updated every second.</div>
+</div>
 
 <div class="card">
   <div><b>Time:</b> <span id="now">--</span></div>
@@ -1006,6 +1123,7 @@ thead th{position:sticky;top:0;background:white;z-index:1}
 
 <div class="card">
   <button onclick="clearData()">Clear stored data</button>
+  <a href="/calibrate">Calibrate ADC</a>
   <span id="action"></span>
 </div>
 
@@ -1166,23 +1284,238 @@ async function clearData(){
   }catch(e){a.textContent='Clear failed: '+e;}
 }
 
+let liveBusy=false;
+async function refreshLive(){
+  // Skip a tick rather than queueing requests behind a slow /api/data.
+  if(liveBusy)return;
+  liveBusy=true;
+  const el=document.getElementById('live');
+  try{
+    const r=await fetch('/api/live',{cache:'no-store'});
+    if(!r.ok)throw new Error('HTTP '+r.status);
+    const d=await r.json();
+    el.textContent=d.volts.toFixed(3);
+    el.classList.remove('stale');
+  }catch(e){
+    el.classList.add('stale');
+  }finally{
+    liveBusy=false;
+  }
+}
+
 updateButtons();
 refreshData();
+refreshLive();
 setInterval(refreshData,10000);
+setInterval(refreshLive,1000);
 </script>
 </body>
 </html>
 '''
 
 
-def send_html(client):
+CAL_HTML = r'''<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Calibrate - Pico Voltage Logger</title>
+<style>
+body{font-family:Arial,sans-serif;margin:18px;background:#f5f5f5;color:#222}
+.card{background:white;padding:16px;margin-bottom:16px;border-radius:8px}
+h1,h2{margin-top:0}
+button{padding:7px 10px;margin:2px;cursor:pointer}
+table{width:100%;border-collapse:collapse}
+th,td{padding:6px;border-bottom:1px solid #ddd;text-align:right}
+th:first-child,td:first-child{text-align:left}
+input{width:7em;padding:4px;text-align:right}
+.small{font-size:.9em;color:#555}
+.live{font-size:2em;font-weight:bold}
+.ok{color:#1a7f37}.bad{color:#c62828}
+.table-scroll{overflow-x:auto}
+</style>
+</head>
+<body>
+<h1>Calibration</h1>
+<p><a href="/">&larr; Back to logger</a></p>
+
+<div class="card">
+  <h2>Current calibration</h2>
+  <div>Vin = <b id="curSlope">--</b> &times; ADC + <b id="curOffset">--</b>
+    <span class="small" id="curSource"></span></div>
+  <div class="small">Factory default: <span id="defSlope">--</span> &times; ADC +
+    <span id="defOffset">--</span></div>
+  <p><span class="live" id="liveV">--</span> V
+     &nbsp; <span class="small">raw ADC <span id="liveRaw">--</span></span></p>
+</div>
+
+<div class="card">
+  <h2>Reference points</h2>
+  <ol class="small">
+    <li>Connect a variable supply to the logger input.</li>
+    <li>Set it to roughly the target voltage and measure it with a
+        multimeter.</li>
+    <li>Type the multimeter reading in <b>Actual V</b>, then press
+        <b>Capture</b>. Keep the supply steady while it samples.</li>
+    <li>Repeat for each row (at least two), then press <b>Calculate</b>.</li>
+  </ol>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Target</th><th>Actual V</th><th></th><th>Raw ADC</th>
+      <th>Noise (min&ndash;max)</th><th>Fitted V</th><th>Error</th></tr></thead>
+    <tbody id="points"></tbody>
+  </table>
+  </div>
+  <button onclick="addPoint()">Add point</button>
+  <button onclick="calculate()">Calculate</button>
+  <div id="result" style="margin-top:10px"></div>
+  <div style="margin-top:10px">
+    <button id="saveBtn" onclick="saveCal()" disabled>Save new calibration</button>
+    <button onclick="resetCal()">Restore factory default</button>
+    <span id="action"></span>
+  </div>
+</div>
+
+<script>
+let points=[3,6,9,12].map(t=>({target:t,actual:t,raw:null,lo:null,hi:null}));
+let fit=null;
+
+function fmt(x,d){return x===null||x===undefined?'--':Number(x).toFixed(d);}
+
+function drawPoints(){
+  let h='';
+  points.forEach((p,i)=>{
+    let fv='--',err='--',cls='';
+    if(fit&&p.raw!==null){
+      const v=fit.slope*p.raw+fit.offset;
+      const e=v-p.actual;
+      fv=v.toFixed(3);err=(e>=0?'+':'')+e.toFixed(3);
+      cls=Math.abs(e)<0.05?'ok':'bad';
+    }
+    h+='<tr><td>'+p.target+' V</td>'+
+      '<td><input type="number" step="0.001" value="'+p.actual+'" '+
+      'onchange="setActual('+i+',this.value)"></td>'+
+      '<td><button onclick="capture('+i+',this)">Capture</button></td>'+
+      '<td>'+fmt(p.raw,1)+'</td>'+
+      '<td>'+(p.lo===null?'--':p.lo+'&ndash;'+p.hi)+'</td>'+
+      '<td>'+fv+'</td><td class="'+cls+'">'+err+'</td></tr>';
+  });
+  document.getElementById('points').innerHTML=h;
+}
+
+function setActual(i,v){points[i].actual=Number(v);fit=null;drawPoints();
+  document.getElementById('saveBtn').disabled=true;}
+
+function addPoint(){
+  const t=prompt('Target voltage for the new point?','14');
+  if(t===null||isNaN(Number(t)))return;
+  points.push({target:Number(t),actual:Number(t),raw:null,lo:null,hi:null});
+  drawPoints();
+}
+
+async function capture(i,btn){
+  btn.disabled=true;btn.textContent='Sampling...';
+  try{
+    const r=await fetch('/api/raw',{cache:'no-store'});
+    if(!r.ok)throw new Error('HTTP '+r.status);
+    const d=await r.json();
+    Object.assign(points[i],{raw:d.raw,lo:d.min,hi:d.max});
+    fit=null;document.getElementById('saveBtn').disabled=true;
+  }catch(e){alert('Capture failed: '+e);}
+  drawPoints();
+}
+
+function calculate(){
+  const p=points.filter(x=>x.raw!==null&&!isNaN(x.actual));
+  const res=document.getElementById('result');
+  if(p.length<2){res.innerHTML='<span class="bad">Capture at least two points.</span>';return;}
+  // Least-squares straight line: actual = slope*raw + offset.
+  const n=p.length;
+  const mx=p.reduce((s,x)=>s+x.raw,0)/n;
+  const my=p.reduce((s,x)=>s+x.actual,0)/n;
+  let sxy=0,sxx=0;
+  p.forEach(x=>{sxy+=(x.raw-mx)*(x.actual-my);sxx+=(x.raw-mx)*(x.raw-mx);});
+  if(sxx===0){res.innerHTML='<span class="bad">Points have identical ADC readings.</span>';return;}
+  const slope=sxy/sxx, offset=my-slope*mx;
+  if(!(slope>1e-6&&slope<1e-2&&offset>-5&&offset<5)){
+    res.innerHTML='<span class="bad">Result out of range (slope '+slope+
+      ', offset '+offset+'). Check the readings.</span>';
+    fit=null;drawPoints();return;
+  }
+  fit={slope:slope,offset:offset};
+  let worst=0;
+  p.forEach(x=>{worst=Math.max(worst,Math.abs(slope*x.raw+offset-x.actual));});
+  res.innerHTML='New: Vin = <b>'+slope.toPrecision(6)+'</b> &times; ADC + <b>'+
+    offset.toFixed(5)+'</b><br><span class="small">Worst-case error at '+
+    'the reference points: '+worst.toFixed(3)+' V</span>';
+  document.getElementById('saveBtn').disabled=false;
+  drawPoints();
+}
+
+async function saveCal(){
+  if(!fit)return;
+  if(!confirm('Save and apply the new calibration?'))return;
+  await post('/api/calibration?slope='+fit.slope.toPrecision(10)+
+    '&offset='+fit.offset.toPrecision(10),'Saved');
+}
+
+async function resetCal(){
+  if(!confirm('Restore the factory default calibration?'))return;
+  await post('/api/calibration/reset','Factory default restored');
+}
+
+async function post(u,msg){
+  const a=document.getElementById('action');
+  try{
+    const r=await fetch(u,{method:'POST'});
+    const d=await r.json();
+    if(!r.ok||!d.ok)throw new Error(d.error||('HTTP '+r.status));
+    a.innerHTML='<span class="ok">'+msg+'</span>';
+    loadCurrent();
+  }catch(e){a.innerHTML='<span class="bad">Failed: '+e+'</span>';}
+}
+
+async function loadCurrent(){
+  try{
+    const d=await (await fetch('/api/calibration',{cache:'no-store'})).json();
+    document.getElementById('curSlope').textContent=d.slope.toPrecision(6);
+    document.getElementById('curOffset').textContent=d.offset.toFixed(5);
+    document.getElementById('curSource').textContent=
+      d.source==='file'?'(from calibration.data)':'(factory default)';
+    document.getElementById('defSlope').textContent=d.default_slope.toPrecision(6);
+    document.getElementById('defOffset').textContent=d.default_offset.toFixed(5);
+  }catch(e){}
+}
+
+let liveBusy=false;
+async function refreshLive(){
+  if(liveBusy)return;
+  liveBusy=true;
+  try{
+    const d=await (await fetch('/api/live',{cache:'no-store'})).json();
+    document.getElementById('liveV').textContent=d.volts.toFixed(3);
+    document.getElementById('liveRaw').textContent=d.raw;
+  }catch(e){}finally{liveBusy=false;}
+}
+
+drawPoints();
+loadCurrent();
+refreshLive();
+setInterval(refreshLive,1000);
+</script>
+</body>
+</html>
+'''
+
+
+def send_page(client, page):
     send_headers(client, "text/html; charset=utf-8", cache=True)
 
-    # Avoid HTML.encode() of the complete page. Send modest slices.
+    # Avoid page.encode() of the complete page. Send modest slices.
     pos = 0
     chunk = 768
-    while pos < len(HTML):
-        send_all(client, HTML[pos:pos + chunk])
+    while pos < len(page):
+        send_all(client, page[pos:pos + chunk])
         pos += chunk
         gc.collect()
 
@@ -1227,10 +1560,57 @@ def handle_client(client):
     method, path, query = parse_request(client)
 
     if path == "/":
-        send_html(client)
+        send_page(client, HTML)
+
+    elif path == "/calibrate":
+        send_page(client, CAL_HTML)
 
     elif path == "/api/data":
         stream_api(client, query)
+
+    elif path == "/api/live":
+        raw = read_live_raw()
+        send_headers(client)
+        send_all(client, '{{"volts":{:.3f},"raw":{}}}'.format(
+            raw_to_mv(raw) / 1000.0, raw))
+
+    elif path == "/api/raw":
+        avg, lo, hi = capture_raw()
+        send_headers(client)
+        send_all(client, '{{"raw":{:.2f},"min":{},"max":{}}}'.format(
+            avg, lo, hi))
+
+    elif path == "/api/calibration" and method == "GET":
+        send_headers(client)
+        send_all(client,
+            '{{"slope":{:.10g},"offset":{:.10g},"source":{},'
+            '"default_slope":{:.10g},"default_offset":{:.10g}}}'.format(
+                CAL_SLOPE, CAL_OFFSET, json_string(CAL_SOURCE),
+                DEFAULT_CAL_SLOPE, DEFAULT_CAL_OFFSET))
+
+    elif path == "/api/calibration" and method == "POST":
+        try:
+            slope = float(query_value(query, "slope", ""))
+            offset = float(query_value(query, "offset", ""))
+        except ValueError:
+            slope = offset = None
+        if slope is None or not valid_calibration(slope, offset):
+            send_headers(client, status="400 Bad Request")
+            send_all(client, '{"ok":false,"error":"invalid slope/offset"}')
+        else:
+            save_calibration(slope, offset)
+            apply_calibration(slope, offset, "file")
+            print("Calibration updated: slope={} offset={}".format(
+                slope, offset))
+            send_headers(client)
+            send_all(client, '{"ok":true}')
+
+    elif path == "/api/calibration/reset" and method == "POST":
+        save_calibration(DEFAULT_CAL_SLOPE, DEFAULT_CAL_OFFSET)
+        apply_calibration(DEFAULT_CAL_SLOPE, DEFAULT_CAL_OFFSET, "default")
+        print("Calibration reset to factory default")
+        send_headers(client)
+        send_all(client, '{"ok":true}')
 
     elif path == "/api/clear" and method == "POST":
         clear_history()
@@ -1269,6 +1649,8 @@ def main():
     print("Binary ring: {} records, {} bytes".format(
         MAX_RECORDS, FILE_SIZE
     ))
+
+    load_calibration()
 
     gc.collect()
     print("Free RAM at startup:", gc.mem_free())

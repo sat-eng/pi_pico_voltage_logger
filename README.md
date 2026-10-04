@@ -48,6 +48,11 @@ when an appropriate input divider and protection circuit are used.
                                       validation and saving
 
   `config.json`                       User configuration
+
+  `calibration.data`                  ADC calibration (slope/offset).
+                                      Created on the device at first
+                                      boot; updated from the web
+                                      calibration page
   -----------------------------------------------------------------------
 
 ## Hardware
@@ -84,6 +89,31 @@ The divider ratio is approximately:
 
 so a 14 V input produces approximately 1.42 V at the ADC.
 
+### Input protection
+
+The development board adds a small amount of protection around the
+divider:
+
+-   a series resistor between the divider node and GP26, to limit any
+    clamp current into the pin
+-   a 3.3 V zener from GP26 to GND (cathode to GP26). It clamps positive
+    excursions at about 3.3 V and, conducting forward, negative ones at
+    about −0.6 V
+-   a reverse-polarity diode across the input (cathode to the input,
+    anode to GND)
+
+> **Do not put a zener between GP26 and 3V3.** A diode in that position
+> (anode to GP26, cathode to 3V3) only clamps *positive* overvoltage.
+> If it is a 3.3 V zener, it sits reverse-biased right at its breakdown
+> voltage whenever the input is low, and leaks current from 3V3 into the
+> ADC node. On the development board this read about 1.1 V with the
+> input at 0 V and squashed the calibration slope to about a third. If a
+> clamp to 3V3 is wanted, use a Schottky diode (e.g. BAT85/BAT54). For a
+> tighter negative clamp, add a Schottky from GND to GP26 (anode to GND).
+
+With the input at 0 V, the raw ADC reading should be in the low
+hundreds. A much higher value points to leakage into the ADC node.
+
 > **Automotive use:** A resistor divider alone is not sufficient
 > protection against automotive electrical transients. Add suitable
 > input protection such as transient suppression/clamping and filtering
@@ -92,23 +122,49 @@ so a 14 V input produces approximately 1.42 V at the ADC.
 
 ## ADC Calibration
 
-The supplied firmware uses the following calibration:
-
-``` python
-CAL_SLOPE = 0.00050893
-CAL_OFFSET = -0.13633
-```
-
-with:
+Voltage is calculated as:
 
 ``` text
-Vin = CAL_SLOPE × ADC_read_u16 + CAL_OFFSET
+Vin = slope × ADC_read_u16 + offset
 ```
 
-These values were derived from measurements on the development hardware.
+The slope and offset are stored on the Pico in `calibration.data`, a
+small JSON file:
+
+``` json
+{"slope":0.00050893,"offset":-0.13633}
+```
+
+If the file is missing or invalid, the firmware falls back to the
+factory default above (derived from measurements on the development
+hardware) and writes it out to create the file.
+
 Component tolerances and ADC characteristics mean that you should
 calibrate your own unit if accurate absolute voltage measurements are
 important.
+
+### Calibrating from the web interface
+
+Open **Calibrate ADC** from the main page (or browse to `/calibrate`).
+
+1.  Connect a variable bench supply to the logger input.
+2.  For each reference point (3, 6, 9 and 12 V by default; more can be
+    added), set the supply to roughly that voltage and measure it with a
+    multimeter.
+3.  Type the multimeter reading into **Actual V** and press
+    **Capture**. The Pico averages 2000 raw ADC reads and shows the
+    result along with its min–max spread.
+4.  Once at least two points are captured, press **Calculate**. A
+    least-squares straight-line fit gives the new slope and offset, and
+    the per-point error is shown.
+5.  Press **Save new calibration**. It takes effect immediately (no
+    reboot) and is written to `calibration.data`.
+
+**Restore factory default** puts back the built-in values. The
+calibration page never touches `config.json`.
+
+Recorded history is stored in calibrated millivolts, so a new
+calibration applies only to readings taken after it is saved.
 
 ## Installing MicroPython
 
@@ -132,6 +188,21 @@ mpremote connect /dev/cu.usbmodem1451201 reset
 ```
 
 Change the serial device name as appropriate for your system.
+
+### Updating the firmware
+
+Once the unit is configured, its `config.json` holds your real settings
+and `calibration.data` holds its calibration. When updating, copy only
+the changed `.py` files so neither is overwritten:
+
+``` bash
+mpremote connect /dev/cu.usbmodem1451201 fs cp main.py :main.py
+mpremote connect /dev/cu.usbmodem1451201 reset
+```
+
+Any `mpremote` command, even `fs ls`, stops the running logger, so
+always finish with `reset`. `mpremote soft-reset` is not enough: it
+leaves the board at the raw REPL and `main.py` does not start.
 
 ## Initial Configuration
 
@@ -242,6 +313,13 @@ The web interface provides live voltage information, a table of recorded
 samples, historical graph navigation, event information, and controls
 for clearing stored history.
 
+A separate "Live voltage" box shows an instantaneous reading, refreshed
+every second from the lightweight `/api/live` endpoint. It is independent
+of the 10-second logging interval and does not affect recorded data.
+
+The **Calibrate ADC** link opens the calibration page (see
+[Calibrating from the web interface](#calibrating-from-the-web-interface)).
+
 The graph supports multiple time windows and navigation through the
 locally stored history.
 
@@ -307,6 +385,7 @@ A useful `.gitignore` entry is:
 
 ``` gitignore
 config.json
+calibration.data
 voltage.bin
 ```
 
