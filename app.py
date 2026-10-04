@@ -805,11 +805,13 @@ def send_all(client, data):
 
 
 def send_headers(client, content_type="application/json",
-                 status="200 OK", cache=False):
+                 status="200 OK", cache=False, max_age=0):
     send_all(client, "HTTP/1.1 {}\r\n".format(status))
     send_all(client, "Content-Type: {}\r\n".format(content_type))
     send_all(client, "Connection: close\r\n")
-    if not cache:
+    if max_age:
+        send_all(client, "Cache-Control: public, max-age={}\r\n".format(max_age))
+    elif not cache:
         send_all(client, "Cache-Control: no-store\r\n")
     send_all(client, "\r\n")
 
@@ -1348,6 +1350,7 @@ def update_status_json():
         "previous": [n for n in UPDATABLE_FILES if file_exists(n + ".old")],
         "enabled": bool(CONFIG.get("update_key", "")),
         "watchdog": watchdog_status(),
+        "free_ram": gc.mem_free(),
         "files": files,
     })
 
@@ -1413,147 +1416,155 @@ def watchdog_status():
 # ============================================================
 
 HTML = r'''<!doctype html>
-<html>
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Pico Voltage Logger</title>
+<link rel="stylesheet" href="/ui.css">
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-<style>
-body{font-family:Arial,sans-serif;margin:18px;background:#f5f5f5;color:#222}
-.card{background:white;padding:16px;margin-bottom:16px;border-radius:8px}
-h1,h2{margin-top:0}
-.metrics{display:flex;gap:24px;flex-wrap:wrap}
-.metric b{font-size:1.4em}
-button{padding:7px 10px;margin:2px;cursor:pointer}
-button.active{font-weight:bold;border:2px solid #333}
-#chartWrap{height:360px}
-.table-scroll{max-height:360px;overflow-y:auto;border:1px solid #ddd}
-table{width:100%;border-collapse:collapse}
-th,td{padding:6px;border-bottom:1px solid #ddd;text-align:right}
-th:first-child,td:first-child{text-align:left}
-thead th{position:sticky;top:0;background:white;z-index:1}
-.measurement-selected{background:#fff2a8}
-.event-list{max-height:240px;overflow-y:auto;border:1px solid #ddd}
-.event-row{padding:8px;border-bottom:1px solid #ddd;cursor:pointer}
-.event-row:hover{background:#f0f0f0}
-.small{font-size:.9em;color:#555}
-.live{font-size:2.6em;font-weight:bold}
-.live.stale{color:#999}
-</style>
 </head>
-<body>
-<h1>Pico Voltage Logger</h1>
-
-<div class="card">
-  <h2>Live voltage</h2>
-  <div><span id="live" class="live stale">--</span> V</div>
-  <div class="small">Instantaneous reading, updated every second.</div>
-</div>
-
-<div class="card">
-  <div><b>Time:</b> <span id="now">--</span></div>
-  <div><b>Status:</b> <span id="status">Starting...</span></div>
-  <div class="metrics">
-    <div class="metric">Average<br><b id="avg">--</b> V</div>
-    <div class="metric">Minimum<br><b id="min">--</b> V</div>
-    <div class="metric">Maximum<br><b id="max">--</b> V</div>
-    <div class="metric">Samples/10s<br><b id="samples">--</b></div>
+<body data-page="dashboard" data-title="Pico Voltage Logger">
+<main>
+<div class="tiles">
+  <div class="tile hero stale" id="liveTile">
+    <div class="label">Live voltage</div>
+    <div class="value"><span id="live">--</span><span class="unit">V</span></div>
+    <div class="small">Instant reading, every second</div>
+  </div>
+  <div class="tile" style="--tile:var(--accent)">
+    <div class="label">Average</div>
+    <div class="value"><span id="avg">--</span><span class="unit">V</span></div>
+  </div>
+  <div class="tile" style="--tile:var(--band)">
+    <div class="label">Minimum</div>
+    <div class="value"><span id="min">--</span><span class="unit">V</span></div>
+  </div>
+  <div class="tile" style="--tile:var(--band)">
+    <div class="label">Maximum</div>
+    <div class="value"><span id="max">--</span><span class="unit">V</span></div>
+  </div>
+  <div class="tile">
+    <div class="label">Samples / 10 s</div>
+    <div class="value"><span id="samples">--</span></div>
   </div>
 </div>
 
 <div class="card">
-  <h2>Detected events</h2>
-  <div class="small">
-    Event: minimum &lt; <span id="lowThreshold">--</span> V or
-    10-second excursion &ge; <span id="dropThreshold">--</span> V.
-    Click an event to centre it in the graph and table.
+  <div class="toolbar">
+    <h2>Voltage history</h2>
+    <div class="seg" role="group" aria-label="Time window">
+      <button data-window="600">10 min</button><button data-window="1800">30 min</button>
+      <button data-window="3600">1 h</button><button data-window="10800">3 h</button>
+      <button data-window="21600">6 h</button><button data-window="43200">12 h</button>
+      <button data-window="86400">24 h</button>
+    </div>
   </div>
-  <div id="events" class="event-list">No events detected.</div>
+  <div class="toolbar">
+    <span class="small" id="range"></span>
+    <div class="seg" role="group" aria-label="Navigate">
+      <button onclick="back()">&lsaquo; Earlier</button>
+      <button onclick="forward()">Later &rsaquo;</button>
+      <button onclick="goNow()">Now</button>
+    </div>
+  </div>
+  <div id="chartWrap"><canvas id="chart" role="img" aria-label="Voltage history: average with minimum to maximum range"></canvas></div>
+  <div class="small" style="margin-top:8px">Click the chart to centre the measurements table on that time.</div>
 </div>
 
-<div class="card">
-  <h2>Voltage history</h2>
-  <div>
-    <button data-window="600">10 min</button>
-    <button data-window="1800">30 min</button>
-    <button data-window="3600">1 hour</button>
-    <button data-window="10800">3 hours</button>
-    <button data-window="21600">6 hours</button>
-    <button data-window="43200">12 hours</button>
-    <button data-window="86400">Full</button>
-    <button onclick="back()">Back</button>
-    <button onclick="forward()">Forward</button>
-    <button onclick="goNow()">Now</button>
+<div class="grid2">
+  <div class="card">
+    <h2>Detected events</h2>
+    <div class="small" style="margin-bottom:10px">Minimum below <b id="lowThreshold">--</b> V or a
+      10-second excursion of at least <b id="dropThreshold">--</b> V. Select an event to centre it.</div>
+    <div class="scroll" id="events"><div class="empty">No events detected.</div></div>
   </div>
-  <div id="range" class="small"></div>
-  <div id="chartWrap"><canvas id="chart"></canvas></div>
-  <div class="small">
-    Click anywhere near a graph point to centre the table on that time.
+  <div class="card">
+    <h2>Measurements</h2>
+    <div class="scroll" id="tableScroll">
+      <table>
+        <thead><tr><th>Time</th><th>Average</th><th>Minimum</th><th>Maximum</th><th>Samples</th></tr></thead>
+        <tbody id="measurementTable"></tbody>
+      </table>
+    </div>
   </div>
 </div>
+</main>
 
-<div class="card">
-  <h2>Measurements</h2>
-  <div id="tableScroll" class="table-scroll">
-    <table>
-      <thead>
-        <tr><th>Time</th><th>Average</th><th>Minimum</th>
-            <th>Maximum</th><th>Samples</th></tr>
-      </thead>
-      <tbody id="measurementTable"></tbody>
-    </table>
-  </div>
-</div>
-
-<div class="card">
-  <button onclick="clearData()">Clear stored data</button>
-  <a href="/calibrate">Calibrate ADC</a> &middot;
-  <a href="/update">Firmware update</a>
-  <span id="action"></span>
-</div>
-
+<script src="/ui.js"></script>
 <script>
-let graphWindow=3600;
-let graphEnd=0;
-let tableCenter=0;
-let selectedEpoch=0;
-let lastData=null;
+let graphWindow=3600, graphEnd=0, tableCenter=0, selectedEpoch=0, lastData=null;
+const css=n=>getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+function rgba(hex,a){const v=parseInt(hex.slice(1),16);
+  return 'rgba('+(v>>16&255)+','+(v>>8&255)+','+(v&255)+','+a+')';}
 
-const ctx=document.getElementById('chart').getContext('2d');
-const voltageChart=new Chart(ctx,{
-  type:'line',
-  data:{labels:[],datasets:[
-    {label:'Average',data:[],pointRadius:0,borderWidth:2},
-    {label:'Minimum',data:[],pointRadius:0,borderWidth:1},
-    {label:'Maximum',data:[],pointRadius:0,borderWidth:1}
-  ]},
-  options:{
-    responsive:true,maintainAspectRatio:false,animation:false,
-    interaction:{mode:'index',intersect:false},
-    onClick:function(event,elements,chart){
-      const p=chart.getElementsAtEventForMode(
-        event,'index',{intersect:false},false);
-      if(!p.length||!lastData)return;
-      const g=lastData.graph[p[0].index];
-      if(g)selectGraphPoint(g.epoch);
-    },
-    scales:{y:{title:{display:true,text:'Voltage (V)'}}}
-  }
-});
+let voltageChart=null;
+if(window.Chart){
+  Chart.defaults.font.family='system-ui,-apple-system,"Segoe UI",Roboto,sans-serif';
+  voltageChart=new Chart(document.getElementById('chart'),{
+    type:'line',
+    data:{labels:[],datasets:[
+      {label:'Maximum',data:[],pointRadius:0,borderWidth:1,fill:false},
+      {label:'Minimum',data:[],pointRadius:0,borderWidth:1,fill:'-1'},
+      {label:'Average',data:[],pointRadius:0,pointHoverRadius:4,borderWidth:2},
+      {label:'Low threshold',data:[],pointRadius:0,borderWidth:1.5,borderDash:[6,4]}
+    ]},
+    options:{
+      responsive:true,maintainAspectRatio:false,animation:false,
+      interaction:{mode:'index',intersect:false},
+      onClick:function(event,elements,chart){
+        const p=chart.getElementsAtEventForMode(event,'index',{intersect:false},false);
+        if(!p.length||!lastData)return;
+        const g=lastData.graph[p[0].index];
+        if(g)selectGraphPoint(g.epoch);
+      },
+      plugins:{
+        legend:{position:'bottom',onClick:()=>{},labels:{usePointStyle:true,boxWidth:24,
+          generateLabels:c=>Chart.defaults.plugins.legend.labels.generateLabels(c)
+            .filter(l=>l.datasetIndex!==0)
+            .map(l=>{if(l.datasetIndex===1){l.text='Min to max range';l.pointStyle='rect';
+              l.fillStyle=c.data.datasets[1].backgroundColor;}else{l.pointStyle='line';}return l;})}},
+        tooltip:{callbacks:{label:c=>' '+c.dataset.label+': '+Number(c.parsed.y).toFixed(3)+' V'}}
+      },
+      scales:{x:{ticks:{maxTicksLimit:innerWidth<520?4:8,maxRotation:0}},
+              y:{title:{display:true,text:'Voltage (V)'}}}
+    }
+  });
+  applyChartTheme();
+  window.addEventListener('load',()=>{applyChartTheme();voltageChart.update();});
+  if(window.matchMedia)matchMedia('(prefers-color-scheme: dark)')
+    .addEventListener('change',()=>{applyChartTheme();voltageChart.update();});
+}else{
+  document.getElementById('chartWrap').innerHTML='<div class="empty">The chart needs Chart.js, '+
+    'which loads from the internet. Events and measurements still work offline.</div>';
+}
+
+function applyChartTheme(){
+  const dark=window.matchMedia&&matchMedia('(prefers-color-scheme: dark)').matches;
+  const acc=css('--accent')||(dark?'#3987e5':'#2a78d6'),crit=css('--crit')||'#d03b3b',
+    ink2=css('--ink-2')||(dark?'#c3c7d0':'#4d5260'),muted=css('--muted')||'#7d828d',
+    line=css('--line')||(dark?'#2b303b':'#e1e5ee');
+  const d=voltageChart.data.datasets;
+  d[0].borderColor=rgba(acc,.45);
+  d[1].borderColor=rgba(acc,.45);d[1].backgroundColor=rgba(acc,.16);
+  d[2].borderColor=acc;d[2].backgroundColor=acc;
+  d[3].borderColor=crit;
+  const o=voltageChart.options;
+  o.plugins.legend.labels.color=ink2;
+  for(const k of ['x','y']){o.scales[k].grid={color:line};o.scales[k].border={color:line};
+    o.scales[k].ticks.color=muted;}
+  o.scales.y.title.color=muted;
+}
 
 function updateButtons(){
   document.querySelectorAll('[data-window]').forEach(b=>{
-    b.classList.toggle('active',Number(b.dataset.window)===graphWindow);
+    const on=Number(b.dataset.window)===graphWindow;
+    b.classList.toggle('active',on);b.setAttribute('aria-pressed',on?'true':'false');
   });
 }
-
 document.querySelectorAll('[data-window]').forEach(b=>{
-  b.onclick=function(){
-    graphWindow=Number(this.dataset.window);
-    graphEnd=0;tableCenter=0;selectedEpoch=0;
-    updateButtons();refreshData();
-  };
+  b.onclick=function(){graphWindow=Number(this.dataset.window);
+    graphEnd=0;tableCenter=0;selectedEpoch=0;updateButtons();refreshData();};
 });
 
 function back(){
@@ -1561,86 +1572,78 @@ function back(){
   if(base){graphEnd=Math.floor(base-graphWindow*0.8);refreshData();}
 }
 function forward(){
-  if(!lastData)return;
-  if(!graphEnd){return;}
+  if(!lastData||!graphEnd)return;
   graphEnd=Math.floor(graphEnd+graphWindow*0.8);
   if(graphEnd>=lastData.latest_epoch)graphEnd=0;
   refreshData();
 }
-function goNow(){
-  graphEnd=0;tableCenter=0;selectedEpoch=0;refreshData();
-}
+function goNow(){graphEnd=0;tableCenter=0;selectedEpoch=0;refreshData();}
 
 function scrollTableToEpoch(epoch){
-  const rows=Array.from(
-    document.querySelectorAll('#measurementTable tr[data-epoch]'));
+  const rows=Array.from(document.querySelectorAll('#measurementTable tr[data-epoch]'));
   if(!rows.length)return;
   let nearest=rows[0],d=Math.abs(Number(nearest.dataset.epoch)-epoch);
-  rows.forEach(r=>{
-    const nd=Math.abs(Number(r.dataset.epoch)-epoch);
-    if(nd<d){nearest=r;d=nd;}
-    r.classList.remove('measurement-selected');
-  });
-  nearest.classList.add('measurement-selected');
+  rows.forEach(r=>{const nd=Math.abs(Number(r.dataset.epoch)-epoch);
+    if(nd<d){nearest=r;d=nd;}r.classList.remove('sel');});
+  nearest.classList.add('sel');
   const sc=document.getElementById('tableScroll');
   sc.scrollTop=nearest.offsetTop-sc.clientHeight/2+nearest.clientHeight/2;
 }
-
 function selectGraphPoint(epoch){
   tableCenter=epoch;selectedEpoch=epoch;
   refreshData().then(()=>setTimeout(()=>scrollTableToEpoch(epoch),80));
 }
-
 function selectEvent(epoch){
-  selectedEpoch=epoch;tableCenter=epoch;
-  graphEnd=Math.floor(epoch+graphWindow/2);
+  selectedEpoch=epoch;tableCenter=epoch;graphEnd=Math.floor(epoch+graphWindow/2);
   refreshData().then(()=>{
-    document.getElementById('chartWrap').scrollIntoView(
-      {behavior:'smooth',block:'center'});
+    document.getElementById('chartWrap').scrollIntoView({behavior:'smooth',block:'center'});
     setTimeout(()=>scrollTableToEpoch(epoch),150);
   });
 }
 
+function setText(id,v){document.getElementById(id).textContent=v;}
 function render(data){
   lastData=data;
-  document.getElementById('now').textContent=data.now_text||'Clock unavailable';
-  document.getElementById('status').textContent=
-    data.clock_valid?'Logging':'Waiting for NTP';
-  document.getElementById('avg').textContent=data.latest_avg.toFixed(3);
-  document.getElementById('min').textContent=data.latest_min.toFixed(3);
-  document.getElementById('max').textContent=data.latest_max.toFixed(3);
-  document.getElementById('samples').textContent=data.latest_samples;
-  document.getElementById('lowThreshold').textContent=
-    data.event_low_voltage.toFixed(2);
-  document.getElementById('dropThreshold').textContent=
-    data.event_drop_volts.toFixed(2);
-  document.getElementById('range').textContent=
-    data.range_start_text+' — '+data.range_end_text;
+  ui.setStatus(data.clock_valid?'Logging · '+(data.now_text||'').slice(-8):'Waiting for NTP',
+    data.clock_valid?'good':'warn');
+  const has=data.latest_epoch>0;
+  setText('avg',has?data.latest_avg.toFixed(3):'--');
+  setText('min',has?data.latest_min.toFixed(3):'--');
+  setText('max',has?data.latest_max.toFixed(3):'--');
+  setText('samples',has?data.latest_samples:'--');
+  setText('lowThreshold',data.event_low_voltage.toFixed(2));
+  setText('dropThreshold',data.event_drop_volts.toFixed(2));
+  setText('range',has?data.range_start_text+' – '+data.range_end_text:'No data recorded yet');
 
-  voltageChart.data.labels=data.graph.map(x=>x.time);
-  voltageChart.data.datasets[0].data=data.graph.map(x=>x.avg);
-  voltageChart.data.datasets[1].data=data.graph.map(x=>x.min);
-  voltageChart.data.datasets[2].data=data.graph.map(x=>x.max);
-  voltageChart.update();
+  if(voltageChart){
+    const ds=voltageChart.data.datasets;
+    voltageChart.data.labels=data.graph.map(x=>x.time);
+    ds[0].data=data.graph.map(x=>x.max);
+    ds[1].data=data.graph.map(x=>x.min);
+    ds[2].data=data.graph.map(x=>x.avg);
+    ds[3].data=data.graph.map(()=>data.event_low_voltage);
+    voltageChart.update();
+  }
 
   let th='';
   data.table.forEach(r=>{
-    const cls=(r.epoch===selectedEpoch)?' class="measurement-selected"':'';
-    th+='<tr data-epoch="'+r.epoch+'"'+cls+'>'+
-      '<td>'+r.time+'</td><td>'+r.avg.toFixed(3)+'</td>'+
-      '<td>'+r.min.toFixed(3)+'</td><td>'+r.max.toFixed(3)+'</td>'+
-      '<td>'+r.samples+'</td></tr>';
+    th+='<tr data-epoch="'+r.epoch+'"'+(r.epoch===selectedEpoch?' class="sel"':'')+'>'+
+      '<td>'+r.time+'</td><td>'+r.avg.toFixed(3)+'</td><td>'+r.min.toFixed(3)+'</td>'+
+      '<td>'+r.max.toFixed(3)+'</td><td>'+r.samples+'</td></tr>';
   });
-  document.getElementById('measurementTable').innerHTML=th;
+  document.getElementById('measurementTable').innerHTML=th||
+    '<tr><td colspan="5" class="empty">No measurements yet.</td></tr>';
 
   let eh='';
   data.events.forEach(e=>{
-    eh+='<div class="event-row" onclick="selectEvent('+e.epoch+')">'+
-      '<b>'+e.time+'</b> — '+e.reason+'<br>'+
-      '<span class="small">Avg '+e.avg.toFixed(3)+' V, Min '+
-      e.min.toFixed(3)+' V, Max '+e.max.toFixed(3)+' V</span></div>';
+    const low=e.reason.indexOf('Low')===0;
+    eh+='<div class="event" role="button" tabindex="0" onclick="selectEvent('+e.epoch+')" '+
+      'onkeydown="if(event.key===\'Enter\')selectEvent('+e.epoch+')">'+
+      '<span class="ico" aria-hidden="true">'+(low?'▼':'↕')+'</span><div>'+
+      '<b>'+e.reason+'</b><div class="small">'+e.time+'<br>avg '+e.avg.toFixed(3)+
+      ' · min '+e.min.toFixed(3)+' · max '+e.max.toFixed(3)+' V</div></div></div>';
   });
-  document.getElementById('events').innerHTML=eh||'No events detected.';
+  document.getElementById('events').innerHTML=eh||'<div class="empty">No events detected.</div>';
 }
 
 async function refreshData(){
@@ -1653,42 +1656,25 @@ async function refreshData(){
     const d=await r.json();
     render(d);
     return d;
-  }catch(e){
-    document.getElementById('status').textContent='Web error: '+e;
-  }
-}
-
-async function clearData(){
-  if(!confirm('Clear all stored voltage history?'))return;
-  const a=document.getElementById('action');
-  try{
-    const r=await fetch('/api/clear',{method:'POST'});
-    if(!r.ok)throw new Error('HTTP '+r.status);
-    graphEnd=0;tableCenter=0;selectedEpoch=0;
-    a.textContent='Data cleared';
-    await refreshData();
-  }catch(e){a.textContent='Clear failed: '+e;}
+  }catch(e){ui.setStatus('Connection lost','crit');}
 }
 
 let liveBusy=false;
 async function refreshLive(){
-  // Skip a tick rather than queueing requests behind a slow /api/data.
   if(liveBusy)return;
   liveBusy=true;
-  const el=document.getElementById('live');
+  const tile=document.getElementById('liveTile');
   try{
     const r=await fetch('/api/live',{cache:'no-store'});
     if(!r.ok)throw new Error('HTTP '+r.status);
     const d=await r.json();
-    el.textContent=d.volts.toFixed(3);
-    el.classList.remove('stale');
-  }catch(e){
-    el.classList.add('stale');
-  }finally{
-    liveBusy=false;
-  }
+    setText('live',d.volts.toFixed(3));
+    tile.classList.remove('stale');
+  }catch(e){tile.classList.add('stale');}
+  finally{liveBusy=false;}
 }
 
+document.addEventListener('datacleared',goNow);
 updateButtons();
 refreshData();
 refreshLive();
@@ -1701,67 +1687,58 @@ setInterval(refreshLive,1000);
 
 
 CAL_HTML = r'''<!doctype html>
-<html>
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Calibrate - Pico Voltage Logger</title>
-<style>
-body{font-family:Arial,sans-serif;margin:18px;background:#f5f5f5;color:#222}
-.card{background:white;padding:16px;margin-bottom:16px;border-radius:8px}
-h1,h2{margin-top:0}
-button{padding:7px 10px;margin:2px;cursor:pointer}
-table{width:100%;border-collapse:collapse}
-th,td{padding:6px;border-bottom:1px solid #ddd;text-align:right}
-th:first-child,td:first-child{text-align:left}
-input{width:7em;padding:4px;text-align:right}
-.small{font-size:.9em;color:#555}
-.live{font-size:2em;font-weight:bold}
-.ok{color:#1a7f37}.bad{color:#c62828}
-.table-scroll{overflow-x:auto}
-</style>
+<link rel="stylesheet" href="/ui.css">
 </head>
-<body>
-<h1>Calibration</h1>
-<p><a href="/">&larr; Back to logger</a></p>
-
-<div class="card">
-  <h2>Current calibration</h2>
-  <div>Vin = <b id="curSlope">--</b> &times; ADC + <b id="curOffset">--</b>
-    <span class="small" id="curSource"></span></div>
-  <div class="small">Factory default: <span id="defSlope">--</span> &times; ADC +
-    <span id="defOffset">--</span></div>
-  <p><span class="live" id="liveV">--</span> V
-     &nbsp; <span class="small">raw ADC <span id="liveRaw">--</span></span></p>
+<body data-page="calibrate" data-title="Calibrate ADC">
+<main>
+<div class="tiles">
+  <div class="tile hero">
+    <div class="label">Live voltage</div>
+    <div class="value"><span id="liveV">--</span><span class="unit">V</span></div>
+    <div class="small">Raw ADC <span id="liveRaw">--</span></div>
+  </div>
+  <div class="tile wide" style="--tile:var(--accent)">
+    <div class="label">Current calibration <span id="curSource" style="text-transform:none;letter-spacing:0;font-weight:400"></span></div>
+    <div class="value" style="font-size:1.15rem;margin-top:8px">Vin = <span id="curSlope">--</span> &times; ADC + <span id="curOffset">--</span></div>
+    <div class="small">Factory default: <span id="defSlope">--</span> &times; ADC + <span id="defOffset">--</span></div>
+  </div>
 </div>
 
 <div class="card">
   <h2>Reference points</h2>
-  <ol class="small">
+  <ol class="small" style="margin:0 0 12px;padding-left:20px">
     <li>Connect a variable supply to the logger input.</li>
-    <li>Set it to roughly the target voltage and measure it with a
-        multimeter.</li>
-    <li>Type the multimeter reading in <b>Actual V</b>, then press
-        <b>Capture</b>. Keep the supply steady while it samples.</li>
+    <li>Set it to roughly the target voltage and measure it with a multimeter.</li>
+    <li>Enter the multimeter reading as <b>Actual V</b>, then press <b>Capture</b>.
+        Keep the supply steady while it samples.</li>
     <li>Repeat for each row (at least two), then press <b>Calculate</b>.</li>
   </ol>
-  <div class="table-scroll">
-  <table>
+  <div class="scroll" style="max-height:none">
+  <table class="pts">
     <thead><tr><th>Target</th><th>Actual V</th><th></th><th>Raw ADC</th>
       <th>Noise (min&ndash;max)</th><th>Fitted V</th><th>Error</th></tr></thead>
     <tbody id="points"></tbody>
   </table>
   </div>
-  <button onclick="addPoint()">Add point</button>
-  <button onclick="calculate()">Calculate</button>
-  <div id="result" style="margin-top:10px"></div>
-  <div style="margin-top:10px">
-    <button id="saveBtn" onclick="saveCal()" disabled>Save new calibration</button>
-    <button onclick="resetCal()">Restore factory default</button>
+  <div class="row" style="margin-top:12px">
+    <button class="btn" onclick="addPoint()">Add point</button>
+    <button class="btn primary" onclick="calculate()">Calculate</button>
+  </div>
+  <div id="result" style="margin-top:12px"></div>
+  <div class="row" style="margin-top:12px">
+    <button class="btn primary" id="saveBtn" onclick="saveCal()" disabled>Save new calibration</button>
+    <button class="btn danger" onclick="resetCal()">Restore factory default</button>
     <span id="action"></span>
   </div>
 </div>
+</main>
 
+<script src="/ui.js"></script>
 <script>
 let points=[3,6,9,12].map(t=>({target:t,actual:t,raw:null,lo:null,hi:null}));
 let fit=null;
@@ -1773,15 +1750,14 @@ function drawPoints(){
   points.forEach((p,i)=>{
     let fv='--',err='--',cls='';
     if(fit&&p.raw!==null){
-      const v=fit.slope*p.raw+fit.offset;
-      const e=v-p.actual;
+      const v=fit.slope*p.raw+fit.offset, e=v-p.actual;
       fv=v.toFixed(3);err=(e>=0?'+':'')+e.toFixed(3);
       cls=Math.abs(e)<0.05?'ok':'bad';
     }
     h+='<tr><td>'+p.target+' V</td>'+
-      '<td><input type="number" step="0.001" value="'+p.actual+'" '+
-      'onchange="setActual('+i+',this.value)"></td>'+
-      '<td><button onclick="capture('+i+',this)">Capture</button></td>'+
+      '<td><input type="number" step="0.001" style="width:7em;text-align:right" value="'+p.actual+'" '+
+      'aria-label="Actual volts for '+p.target+' V point" onchange="setActual('+i+',this.value)"></td>'+
+      '<td><button class="btn" onclick="capture('+i+',this)">Capture</button></td>'+
       '<td>'+fmt(p.raw,1)+'</td>'+
       '<td>'+(p.lo===null?'--':p.lo+'&ndash;'+p.hi)+'</td>'+
       '<td>'+fv+'</td><td class="'+cls+'">'+err+'</td></tr>';
@@ -1807,7 +1783,7 @@ async function capture(i,btn){
     const d=await r.json();
     Object.assign(points[i],{raw:d.raw,lo:d.min,hi:d.max});
     fit=null;document.getElementById('saveBtn').disabled=true;
-  }catch(e){alert('Capture failed: '+e);}
+  }catch(e){ui.toast('Capture failed: '+e.message);}
   drawPoints();
 }
 
@@ -1817,8 +1793,7 @@ function calculate(){
   if(p.length<2){res.innerHTML='<span class="bad">Capture at least two points.</span>';return;}
   // Least-squares straight line: actual = slope*raw + offset.
   const n=p.length;
-  const mx=p.reduce((s,x)=>s+x.raw,0)/n;
-  const my=p.reduce((s,x)=>s+x.actual,0)/n;
+  const mx=p.reduce((s,x)=>s+x.raw,0)/n, my=p.reduce((s,x)=>s+x.actual,0)/n;
   let sxy=0,sxx=0;
   p.forEach(x=>{sxy+=(x.raw-mx)*(x.actual-my);sxx+=(x.raw-mx)*(x.raw-mx);});
   if(sxx===0){res.innerHTML='<span class="bad">Points have identical ADC readings.</span>';return;}
@@ -1832,17 +1807,16 @@ function calculate(){
   let worst=0;
   p.forEach(x=>{worst=Math.max(worst,Math.abs(slope*x.raw+offset-x.actual));});
   res.innerHTML='New: Vin = <b>'+slope.toPrecision(6)+'</b> &times; ADC + <b>'+
-    offset.toFixed(5)+'</b><br><span class="small">Worst-case error at '+
-    'the reference points: '+worst.toFixed(3)+' V</span>';
+    offset.toFixed(5)+'</b><br><span class="small">Worst-case error at the reference points: '+
+    worst.toFixed(3)+' V</span>';
   document.getElementById('saveBtn').disabled=false;
   drawPoints();
 }
 
 async function saveCal(){
-  if(!fit)return;
-  if(!confirm('Save and apply the new calibration?'))return;
+  if(!fit||!confirm('Save and apply the new calibration?'))return;
   await post('/api/calibration?slope='+fit.slope.toPrecision(10)+
-    '&offset='+fit.offset.toPrecision(10),'Saved');
+    '&offset='+fit.offset.toPrecision(10),'Calibration saved');
 }
 
 async function resetCal(){
@@ -1851,14 +1825,13 @@ async function resetCal(){
 }
 
 async function post(u,msg){
-  const a=document.getElementById('action');
   try{
     const r=await fetch(u,{method:'POST'});
     const d=await r.json();
     if(!r.ok||!d.ok)throw new Error(d.error||('HTTP '+r.status));
-    a.innerHTML='<span class="ok">'+msg+'</span>';
+    ui.toast(msg);
     loadCurrent();
-  }catch(e){a.innerHTML='<span class="bad">Failed: '+e+'</span>';}
+  }catch(e){ui.toast('Failed: '+e.message);}
 }
 
 async function loadCurrent(){
@@ -1867,7 +1840,7 @@ async function loadCurrent(){
     document.getElementById('curSlope').textContent=d.slope.toPrecision(6);
     document.getElementById('curOffset').textContent=d.offset.toFixed(5);
     document.getElementById('curSource').textContent=
-      d.source==='file'?'(from calibration.data)':'(factory default)';
+      d.source==='file'?'(calibrated)':'(factory default)';
     document.getElementById('defSlope').textContent=d.default_slope.toPrecision(6);
     document.getElementById('defOffset').textContent=d.default_offset.toFixed(5);
   }catch(e){}
@@ -1894,30 +1867,178 @@ setInterval(refreshLive,1000);
 '''
 
 
+# Shared by all three pages (served as /ui.css and /ui.js) so the
+# styling and menu exist once in RAM rather than in every page.
+UI_CSS = r''':root{color-scheme:light;--plane:#eef2f8;--surface:#fff;--surface-2:#f5f7fb;--ink:#151821;--ink-2:#4d5260;--muted:#7d828d;--line:#e1e5ee;--accent:#2a78d6;--band:#86b6ef;--accent-soft:#e7f0fc;--good:#0ca30c;--warn:#fab219;--crit:#d03b3b;--hdr-a:#123f7a;--hdr-b:#2a78d6;--shadow:0 1px 2px rgba(16,24,40,.05),0 6px 18px rgba(16,24,40,.06)}
+@media (prefers-color-scheme:dark){:root{color-scheme:dark;--plane:#0d1015;--surface:#171a21;--surface-2:#1f232c;--ink:#f1f3f7;--ink-2:#c3c7d0;--muted:#8b909b;--line:#2b303b;--accent:#3987e5;--band:#5598e7;--accent-soft:rgba(57,135,229,.16);--hdr-a:#0b2b55;--hdr-b:#1c5cab;--shadow:0 1px 2px rgba(0,0,0,.4)}}
+*{box-sizing:border-box}
+[hidden]{display:none!important}
+body{margin:0;font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;background:var(--plane);color:var(--ink);line-height:1.45;-webkit-text-size-adjust:100%}
+a{color:var(--accent)}
+.topbar{position:sticky;top:0;z-index:20;display:flex;align-items:center;gap:12px;padding:10px 16px;background:linear-gradient(115deg,var(--hdr-a),var(--hdr-b));color:#fff;box-shadow:0 2px 12px rgba(0,0,0,.18)}
+.topbar h1{flex:1;margin:0;font-size:1.05rem;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.icon-btn{display:inline-flex;align-items:center;justify-content:center;width:40px;height:40px;flex:none;border:0;border-radius:10px;background:rgba(255,255,255,.12);color:#fff;cursor:pointer}
+.icon-btn:hover{background:rgba(255,255,255,.24)}
+.icon-btn:focus-visible,.btn:focus-visible,.seg button:focus-visible,.drawer a:focus-visible,.drawer button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.pill{display:inline-flex;align-items:center;gap:7px;padding:5px 11px;border-radius:999px;background:rgba(255,255,255,.15);font-size:.85rem;white-space:nowrap;font-variant-numeric:tabular-nums}
+.dot{width:8px;height:8px;border-radius:50%;background:#c3c2b7;flex:none}
+.dot.good{background:#3ad13a}.dot.warn{background:var(--warn)}.dot.crit{background:#ff6b6b}
+.drawer{position:fixed;top:0;bottom:0;left:0;z-index:40;display:flex;flex-direction:column;width:min(290px,86vw);background:var(--surface);box-shadow:6px 0 28px rgba(0,0,0,.25);transform:translateX(-105%);transition:transform .22s ease;visibility:hidden}
+.drawer.open{transform:none;visibility:visible}
+.drawer-head{display:flex;align-items:center;justify-content:space-between;padding:14px 12px 14px 18px;background:linear-gradient(115deg,var(--hdr-a),var(--hdr-b));color:#fff;font-weight:600}
+.drawer nav{padding:10px;overflow-y:auto}
+.drawer a,.drawer button.item{display:flex;align-items:center;gap:12px;width:100%;padding:11px 12px;border:0;border-radius:10px;background:none;color:var(--ink);font:inherit;text-align:left;text-decoration:none;cursor:pointer}
+.drawer a:hover,.drawer button.item:hover{background:var(--surface-2)}
+.drawer a.current{background:var(--accent-soft);color:var(--accent);font-weight:600}
+.drawer svg{flex:none}
+.drawer hr{margin:8px 4px;border:0;border-top:1px solid var(--line)}
+.drawer .danger{color:var(--crit)}
+.drawer .foot{margin-top:auto;padding:12px 18px;font-size:.8rem;color:var(--muted)}
+.scrim{position:fixed;inset:0;z-index:30;background:rgba(8,12,20,.45);opacity:0;pointer-events:none;transition:opacity .22s}
+.scrim.open{opacity:1;pointer-events:auto}
+main{max-width:1180px;margin:0 auto;padding:16px}
+.card{margin-bottom:16px;padding:16px;background:var(--surface);border:1px solid var(--line);border-radius:14px;box-shadow:var(--shadow)}
+.card h2{margin:0 0 10px;font-size:1rem;font-weight:600}
+.small{font-size:.85rem;color:var(--muted)}
+.btn{padding:8px 14px;border:1px solid var(--line);border-radius:10px;background:var(--surface);color:var(--ink);font:inherit;font-size:.9rem;cursor:pointer}
+.btn:hover{background:var(--surface-2)}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+.btn.primary:hover{filter:brightness(1.08)}
+.btn.danger{color:var(--crit)}
+.btn:disabled{opacity:.5;cursor:default;filter:none}
+.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.ok{color:var(--good)}.bad{color:var(--crit)}
+table{width:100%;border-collapse:collapse;font-size:.9rem;font-variant-numeric:tabular-nums}
+th,td{padding:8px 10px;border-bottom:1px solid var(--line);text-align:right;white-space:nowrap}
+th:first-child,td:first-child{text-align:left}
+thead th{position:sticky;top:0;background:var(--surface-2);color:var(--ink-2);font-size:.82rem;font-weight:600}
+tbody tr:hover td{background:var(--surface-2)}
+tr.sel td{background:var(--accent-soft)}
+input{font:inherit;color:var(--ink);background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:6px 8px}
+code{font-size:.9em;word-break:break-all}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:16px}
+.tile{position:relative;overflow:hidden;padding:14px 16px 14px 18px;background:var(--surface);border:1px solid var(--line);border-radius:14px;box-shadow:var(--shadow)}
+.tile::before{content:"";position:absolute;top:0;bottom:0;left:0;width:4px;background:var(--tile,var(--line))}
+.tile .label{font-size:.76rem;font-weight:600;letter-spacing:.05em;text-transform:uppercase;color:var(--ink-2)}
+.tile .value{margin-top:4px;font-size:1.75rem;font-weight:650;font-variant-numeric:tabular-nums}
+.unit{margin-left:3px;font-size:.9rem;font-weight:500;color:var(--muted)}
+.tile.hero,.tile.wide{grid-column:span 2}
+.tile.hero{background:linear-gradient(135deg,var(--hdr-b),var(--hdr-a));border:0;color:#fff}
+.tile.hero::before{display:none}
+.tile.hero .label,.tile.hero .unit,.tile.hero .small{color:rgba(255,255,255,.8)}
+.tile.hero .value{font-size:2.6rem;line-height:1.15}
+.tile.stale .value{opacity:.45}
+.toolbar{display:flex;flex-wrap:wrap;gap:8px 12px;align-items:center;justify-content:space-between;margin-bottom:10px}
+.toolbar h2{margin:0}
+.seg{display:inline-flex;flex-wrap:wrap;gap:2px;padding:3px;background:var(--surface-2);border:1px solid var(--line);border-radius:10px}
+.seg button{padding:6px 10px;border:0;border-radius:8px;background:none;color:var(--ink-2);font:inherit;font-size:.84rem;cursor:pointer}
+.seg button:hover{color:var(--ink)}
+.seg button.active{background:var(--surface);color:var(--accent);font-weight:600;box-shadow:0 1px 3px rgba(0,0,0,.14)}
+#chartWrap{position:relative;height:340px}
+.grid2{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.4fr);gap:16px}
+.grid2 .card{margin-bottom:0}
+.scroll{max-height:380px;overflow:auto;border:1px solid var(--line);border-radius:10px}
+.event{display:flex;gap:10px;padding:10px 12px;border-left:3px solid var(--crit);border-bottom:1px solid var(--line);cursor:pointer}
+.event:hover{background:var(--surface-2)}
+.event .ico{color:var(--crit);font-weight:700}
+.empty{padding:28px 16px;text-align:center;color:var(--muted)}
+.kv{width:auto}
+.kv td{text-align:left;padding:6px 14px 6px 0;border:0}
+.kv td:first-child{color:var(--ink-2)}
+.toast{position:fixed;left:50%;bottom:22px;z-index:50;max-width:calc(100% - 32px);padding:10px 16px;border-radius:10px;background:var(--ink);color:var(--surface);box-shadow:var(--shadow);transform:translateX(-50%);opacity:0;pointer-events:none;transition:opacity .2s}
+.toast.show{opacity:1}
+@media (max-width:900px){.grid2{grid-template-columns:minmax(0,1fr)}}
+@media (max-width:520px){.tile.hero,.tile.wide{grid-column:1/-1}.seg button{padding:6px 7px}#chartWrap{height:260px}}
+'''
+
+
+UI_JS = r'''(function(){
+// Shared header, slide-out menu and notifications for every page.
+// A page sets <body data-page="..." data-title="...">.
+const B=document.body,page=B.dataset.page||'';
+const svg=d=>'<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'+d+'</svg>';
+const I={
+  menu:svg('<path d="M4 6h16M4 12h16M4 18h16"/>'),
+  close:svg('<path d="M6 6l12 12M18 6L6 18"/>'),
+  chart:svg('<path d="M3 3v18h18"/><path d="M7 15l4-4 3 3 5-6"/>'),
+  cal:svg('<path d="M12 3v3M12 18v3M3 12h3M18 12h3"/><circle cx="12" cy="12" r="5"/>'),
+  up:svg('<path d="M12 16V4M7 9l5-5 5 5"/><path d="M4 20h16"/>'),
+  trash:svg('<path d="M4 7h16M10 11v6M14 11v6"/><path d="M6 7l1 13h10l1-13M9 7V4h6v3"/>')
+};
+const link=(href,id,icon,text)=>'<a href="'+href+'"'+(page===id?' class="current" aria-current="page"':'')+'>'+icon+text+'</a>';
+
+const hdr=document.createElement('header');
+hdr.className='topbar';
+hdr.innerHTML='<button class="icon-btn" id="menuBtn" aria-label="Open menu" aria-expanded="false" aria-controls="drawer">'+I.menu+'</button>'+
+  '<h1>'+(B.dataset.title||'Pico Voltage Logger')+'</h1>'+
+  '<span class="pill" id="statusPill" hidden><span class="dot" id="statusDot"></span><span class="txt" id="statusText"></span></span>';
+B.prepend(hdr);
+
+const dr=document.createElement('aside');
+dr.className='drawer';dr.id='drawer';dr.setAttribute('aria-label','Menu');
+dr.innerHTML='<div class="drawer-head"><span>Pico Voltage Logger</span>'+
+  '<button class="icon-btn" id="menuClose" aria-label="Close menu">'+I.close+'</button></div>'+
+  '<nav>'+link('/','dashboard',I.chart,'Dashboard')+link('/calibrate','calibrate',I.cal,'Calibrate ADC')+
+  link('/update','update',I.up,'Firmware update')+'<hr>'+
+  '<button class="item danger" id="clearBtn">'+I.trash+'Clear stored data</button></nav>'+
+  '<div class="foot">24-hour voltage logger</div>';
+const scrim=document.createElement('div');scrim.className='scrim';
+const toastEl=document.createElement('div');toastEl.className='toast';toastEl.setAttribute('role','status');
+B.append(dr,scrim,toastEl);
+
+const btn=document.getElementById('menuBtn');
+function setOpen(o){
+  dr.classList.toggle('open',o);scrim.classList.toggle('open',o);
+  btn.setAttribute('aria-expanded',o?'true':'false');
+  if(o)(dr.querySelector('a,button.item')||dr).focus();else btn.focus();
+}
+btn.onclick=()=>setOpen(true);
+document.getElementById('menuClose').onclick=()=>setOpen(false);
+scrim.onclick=()=>setOpen(false);
+document.addEventListener('keydown',e=>{if(e.key==='Escape'&&dr.classList.contains('open'))setOpen(false);});
+
+let toastTimer=0;
+function toast(msg){
+  toastEl.textContent=msg;toastEl.classList.add('show');
+  clearTimeout(toastTimer);toastTimer=setTimeout(()=>toastEl.classList.remove('show'),3500);
+}
+
+document.getElementById('clearBtn').onclick=async()=>{
+  setOpen(false);
+  if(!confirm('Clear all stored voltage history? This cannot be undone.'))return;
+  try{
+    const r=await fetch('/api/clear',{method:'POST'});
+    if(!r.ok)throw new Error('HTTP '+r.status);
+    toast('Stored data cleared');
+    document.dispatchEvent(new Event('datacleared'));
+  }catch(e){toast('Clear failed: '+e.message);}
+};
+
+window.ui={
+  toast:toast,
+  setStatus:function(text,kind){
+    document.getElementById('statusPill').hidden=false;
+    document.getElementById('statusText').textContent=text;
+    document.getElementById('statusDot').className='dot '+(kind||'');
+  }
+};
+})();
+'''
+
+
 UPDATE_HTML = r'''<!doctype html>
-<html>
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Firmware update - Pico Voltage Logger</title>
-<style>
-body{font-family:Arial,sans-serif;margin:18px;background:#f5f5f5;color:#222}
-.card{background:white;padding:16px;margin-bottom:16px;border-radius:8px}
-h1,h2{margin-top:0}
-button{padding:7px 10px;margin:2px;cursor:pointer}
-td{padding:3px 12px 3px 0;vertical-align:top}
-.small{font-size:.9em;color:#555}
-.ok{color:#1a7f37}.bad{color:#c62828}
-code{word-break:break-all}
-</style>
+<link rel="stylesheet" href="/ui.css">
 </head>
-<body>
-<h1>Firmware update</h1>
-<p><a href="/">&larr; Back to logger</a></p>
-
+<body data-page="update" data-title="Firmware update">
+<main>
 <div class="card">
   <h2>Status</h2>
-  <table>
+  <table class="kv">
     <tr><td>State</td><td id="state">--</td></tr>
     <tr><td>Version</td><td id="version">--</td></tr>
     <tr><td>Rollback available</td><td id="previous">--</td></tr>
@@ -1929,30 +2050,31 @@ code{word-break:break-all}
 
 <div class="card">
   <h2>Upload package</h2>
-  <p class="small">Choose a <code>.pvlpkg</code> file built with
-  <code>make_package.py</code>. The logger checks its signature, stages
-  the files and reboots. The new version is confirmed after it has run
-  for a minute with the web server up; if it fails first, the logger
-  rolls back to the previous version.</p>
-  <input type="file" id="pkg" accept=".pvlpkg">
-  <button onclick="upload()">Upload and install</button>
-  <div id="action" style="margin-top:10px"></div>
+  <p class="small" style="margin-top:0">Choose a <code>.pvlpkg</code> file built with
+  <code>make_package.py</code>. The logger checks its signature, stages the files and
+  reboots. The new version is confirmed after it has run for a minute with the web
+  server up; if it fails first, the logger rolls back to the previous version.</p>
+  <div class="row">
+    <input type="file" id="pkg" accept=".pvlpkg" aria-label="Update package">
+    <button class="btn primary" onclick="upload()">Upload and install</button>
+  </div>
+  <div id="action" style="margin-top:12px"></div>
 </div>
+</main>
 
+<script src="/ui.js"></script>
 <script>
-const STATES={none:'No update installed',pending:'Pending confirmation',
-  good:'Confirmed',rolled_back:'Rolled back',usb_deployed:'Deployed over USB'};
+const STATES={none:'No update installed',pending:'Pending confirmation',good:'Confirmed',
+  rolled_back:'Rolled back',usb_deployed:'Deployed over USB'};
 
 async function loadStatus(){
   try{
     const d=await (await fetch('/api/update/status',{cache:'no-store'})).json();
     document.getElementById('state').textContent=STATES[d.state]||d.state;
     document.getElementById('version').textContent=d.version||'--';
-    document.getElementById('previous').textContent=
-      d.previous.length?d.previous.join(', '):'no';
-    document.getElementById('enabled').innerHTML=d.enabled?
-      '<span class="ok">enabled</span>':
-      '<span class="bad">disabled: set update_key over BLE</span>';
+    document.getElementById('previous').textContent=d.previous.length?d.previous.join(', '):'no';
+    document.getElementById('enabled').innerHTML=d.enabled?'<span class="ok">✓ enabled</span>':
+      '<span class="bad">✕ disabled: set update_key over BLE</span>';
     document.getElementById('watchdog').textContent=d.watchdog||'--';
     document.getElementById('reason').textContent=d.reason?('Reason: '+d.reason):'';
     return d;
@@ -1968,9 +2090,8 @@ async function upload(){
     const r=await fetch('/api/update',{method:'POST',body:f});
     const d=await r.json();
     if(!d.ok)throw new Error(d.error||('HTTP '+r.status));
-    a.innerHTML='<span class="ok">Installed '+(d.version||'')+' ('+
-      d.files.join(', ')+'). Rebooting; this page will show when the '+
-      'update is confirmed.</span>';
+    a.innerHTML='<span class="ok">Installed '+(d.version||'')+' ('+d.files.join(', ')+
+      '). Rebooting; this page will show when the update is confirmed.</span>';
     waitForConfirm();
   }catch(e){a.innerHTML='<span class="bad">Upload failed: '+e.message+'</span>';}
 }
@@ -1980,14 +2101,11 @@ function waitForConfirm(){
   const start=Date.now();
   const t=setInterval(async()=>{
     const d=await loadStatus();
-    if(d&&d.state==='good'){clearInterval(t);
-      a.innerHTML='<span class="ok">Update confirmed.</span>';}
+    if(d&&d.state==='good'){clearInterval(t);a.innerHTML='<span class="ok">✓ Update confirmed.</span>';}
     else if(d&&d.state==='rolled_back'){clearInterval(t);
-      a.innerHTML='<span class="bad">The new version failed and was rolled back: '+
-        d.reason+'</span>';}
+      a.innerHTML='<span class="bad">The new version failed and was rolled back: '+d.reason+'</span>';}
     else if(Date.now()-start>300000){clearInterval(t);
-      a.innerHTML='<span class="bad">No confirmation after 5 minutes; '+
-        'check update-status over BLE.</span>';}
+      a.innerHTML='<span class="bad">No confirmation after 5 minutes; check update-status over BLE.</span>';}
   },5000);
 }
 
@@ -1998,16 +2116,47 @@ loadStatus();
 '''
 
 
-def send_page(client, page):
-    send_headers(client, "text/html; charset=utf-8", cache=True)
+# Browsers cache /ui.css and /ui.js for a day (fewer requests to this
+# single-connection server). A content hash added to their URLs as pages are
+# sent makes browsers fetch new copies after an update. Hashing in small
+# slices and inserting the tag while streaming avoids copying whole pages,
+# which can fail on a fragmented heap.
+def _asset_version():
+    h = hashlib.sha256()
+    for text in (UI_CSS, UI_JS):
+        for i in range(0, len(text), 512):
+            h.update(text[i:i + 512].encode())
+    return binascii.hexlify(h.digest()[:4]).decode()
+
+
+UI_VERSION = _asset_version()
+ASSET_URLS = ("/ui.css", "/ui.js")
+
+
+def send_page(client, page, content_type="text/html; charset=utf-8",
+              max_age=0):
+    send_headers(client, content_type, cache=True, max_age=max_age)
+
+    # Where to insert "?v=<version>" (just after each asset URL).
+    cuts = []
+    for url in ASSET_URLS:
+        i = page.find(url)
+        if i >= 0:
+            cuts.append(i + len(url))
+    cuts.sort()
+    cuts.append(len(page))
 
     # Avoid page.encode() of the complete page. Send modest slices.
     pos = 0
     chunk = 768
-    while pos < len(page):
-        send_all(client, page[pos:pos + chunk])
-        pos += chunk
-        gc.collect()
+    for cut in cuts:
+        while pos < cut:
+            end = min(pos + chunk, cut)
+            send_all(client, page[pos:end])
+            pos = end
+            gc.collect()
+        if cut < len(page):
+            send_all(client, "?v=" + UI_VERSION)
 
 
 # ============================================================
@@ -2067,6 +2216,13 @@ def handle_client(client):
 
     elif path == "/update":
         send_page(client, UPDATE_HTML)
+
+    elif path == "/ui.css":
+        send_page(client, UI_CSS, "text/css; charset=utf-8", max_age=86400)
+
+    elif path == "/ui.js":
+        send_page(client, UI_JS, "application/javascript; charset=utf-8",
+                  max_age=86400)
 
     elif path == "/api/update/status":
         send_headers(client)
@@ -2151,7 +2307,9 @@ def start_server():
     server = socket.socket()
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind(addr)
-    server.listen(2)
+    # A page load fetches the page, ui.css, ui.js and two API calls at
+    # once; connections are served one at a time, so let them queue.
+    server.listen(5)
     server.settimeout(0.05)
 
     print("Web server listening on http://{}/".format(

@@ -79,7 +79,7 @@ under CPython with stubbed `machine`/`time` modules.
   (`config_command`), Wi-Fi connection management, the over-the-air update receiver, and a
   hand-rolled HTTP server (raw sockets, no `uasyncio`/framework) that serves an inlined
   HTML+JS+Chart.js single-page UI, a calibration page (`/calibrate`), an update page (`/update`),
-  and a JSON API: `/api/data` (10 s poll), `/api/live` (1 s instant reading + raw ADC),
+  shared assets (`/ui.css`, `/ui.js`), and a JSON API: `/api/data` (10 s poll), `/api/live` (1 s instant reading + raw ADC),
   `/api/raw` (2000-sample average for calibration), `/api/calibration` (GET/POST),
   `/api/calibration/reset`, `/api/clear` (POST), `/api/update/status` (GET) and `/api/update`
   (POST, raw package body). Small POST parameters go in the query string; only `/api/update`
@@ -179,9 +179,19 @@ don't replace this with a timezone library call, none is available on-device.
 Hand-rolled over raw `socket`, not a framework. Requests are parsed minimally (`parse_request`
 reads the request line and skips headers, keeping only `Content-Length`). Responses are streamed
 in small chunks via `send_all()`/`send_headers()` rather than building full strings in memory,
-for the same low-RAM reason as the ring buffer. The web UI lives in three string constants in
-`app.py`, `HTML` (main page), `CAL_HTML` (calibration) and `UPDATE_HTML` (firmware update), all
-sent by `send_page()`. There are no separate template or static-asset files. Large JSON is
+for the same low-RAM reason as the ring buffer. The web UI lives in string constants in `app.py`: `HTML`
+(dashboard), `CAL_HTML` (calibration) and `UPDATE_HTML` (firmware update), plus `UI_CSS` and
+`UI_JS`, which all pages share via `/ui.css` and `/ui.js`. `UI_JS` builds the header, the
+slide-out menu (including "Clear stored data") and toasts; pages set
+`<body data-page=… data-title=…>` and call `ui.setStatus()`/`ui.toast()`. Colours are CSS custom
+properties with a `prefers-color-scheme: dark` set; the dashboard's Chart.js colours are read from
+them in `applyChartTheme()` (with fallbacks). `send_page()` streams pages in slices and inserts
+`?v=<UI_VERSION>` after the asset URLs as it goes; the assets are sent with a one-day
+`max-age`, so later page loads skip them. There are no separate template or static-asset files.
+**Don't build large strings at import or per request** (e.g. `str.replace` on a whole page):
+after the pages grew to ~32 KB, an 11 KB allocation at import raised `MemoryError` on the
+fragmented heap (the update rolled back). Work in slices instead. `server.listen(5)` lets a page
+load's parallel requests queue, since connections are served one at a time. Large JSON is
 hand-assembled with f-string-style formatting and the `json_string()` escaper, not `json.dumps`,
 to avoid building a large in-memory structure before sending (`json.dumps` is used only for small
 replies such as update status).

@@ -461,19 +461,34 @@ like a conventional serial console.
 
 Once Wi-Fi is connected, open the Pico's IP address in a web browser.
 
-The web interface provides live voltage information, a table of recorded
-samples, historical graph navigation, event information, and controls
-for clearing stored history.
+The dashboard shows:
 
-A separate "Live voltage" box shows an instantaneous reading, refreshed
-every second from the lightweight `/api/live` endpoint. It is independent
-of the 10-second logging interval and does not affect recorded data.
+-   **Live voltage**: an instantaneous reading, refreshed every second
+    from the lightweight `/api/live` endpoint. It is independent of the
+    10-second logging interval and does not affect recorded data.
+-   **Average, minimum, maximum and sample count** for the latest
+    10-second record.
+-   **Voltage history**: the average as a line inside a shaded
+    minimum-to-maximum band, with the low-voltage event threshold as a
+    dashed line. Choose a window from 10 minutes to 24 hours and step
+    earlier or later through the stored history. Clicking the chart
+    centres the measurements table on that time.
+-   **Detected events** and the **measurements** table.
 
-The **Calibrate ADC** link opens the calibration page (see
-[Calibrating from the web interface](#calibrating-from-the-web-interface)).
+The header shows the logger's status (logging, waiting for NTP, or
+connection lost) and the current time. The menu button at the top left
+opens a side menu with **Dashboard**, **Calibrate ADC** (see
+[Calibrating from the web interface](#calibrating-from-the-web-interface)),
+**Firmware update** (see [Over-the-Air Updates](#over-the-air-updates))
+and **Clear stored data**, which asks for confirmation before erasing
+the history.
 
-The graph supports multiple time windows and navigation through the
-locally stored history.
+The pages follow the light or dark setting of your phone or computer
+and adapt to phone screens.
+
+The chart uses Chart.js, which loads from the internet. Without internet
+access the dashboard says so, and the readings, events and measurements
+still work.
 
 ## Data Storage
 
