@@ -26,9 +26,15 @@ mpremote connect /dev/cu.usbmodemXXXX fs cp config.json :config.json
 mpremote connect /dev/cu.usbmodemXXXX reset
 ```
 
+For updates, use `./deploy.py`. It finds the board holding this project's
+`.deploy-manifest.json` (SHA-256 per managed file), copies only changed files from
+`MANAGED_FILES`, rewrites the manifest and hard-resets the board. Run `--init --port <port>`
+once per board; `--dry-run`, `--force` and `--list` are also available. When adding a new
+firmware file, add it to `MANAGED_FILES` in `deploy.py`.
+
 The device's own `config.json` (real Wi-Fi credentials) and `calibration.data` (created on
-first boot, updated from the `/calibrate` web page) are live state. When redeploying code, copy
-only the changed `.py` files and don't overwrite these two.
+first boot, updated from the `/calibrate` web page) are live state. `deploy.py` never
+overwrites them; if copying by hand, copy only the changed `.py` files.
 
 Any `mpremote` command (even `fs ls`/`fs cat`) interrupts the running logger. Restart it with
 `mpremote … reset`. `mpremote … soft-reset` leaves the board in raw REPL, so `main.py` does
@@ -73,6 +79,8 @@ Three files, each with a distinct responsibility:
 ### Cooperative single-threaded main loop
 
 There is one thread. `main()`'s `while True` loop calls `sample_if_due()`, `service_ble()`,
+`service_led()` (on-board LED: flashing until `clock_valid` and Wi-Fi connected, then steady;
+also called from the `connect_wifi()` wait loop),
 periodic record/NTP/Wi-Fi-retry checks, and `server.accept()` every iteration with short/no
 blocking. Any code that can take nontrivially long (writing the ring-buffer file, streaming an
 HTTP response, connecting to Wi-Fi) calls `service_sampling()` periodically from inside its own

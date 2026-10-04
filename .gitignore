@@ -1,0 +1,3 @@
+# Local cache of the logger board's USB serial (written by deploy.py)
+.deploy-device
+__pycache__/

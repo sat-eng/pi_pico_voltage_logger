@@ -24,6 +24,8 @@ when an appropriate input divider and protection circuit are used.
 -   Historical graph with selectable time windows
 -   Event detection for low-voltage and sudden voltage-drop conditions
 -   NTP time synchronisation
+-   On-board LED status: flashing until Wi-Fi is connected and the
+    clock is set by NTP, then steady
 -   UK GMT/BST local-time handling
 -   BLE configuration console using the Nordic UART Service (NUS)
 -   BLE startup status/welcome screen
@@ -48,6 +50,9 @@ when an appropriate input divider and protection circuit are used.
                                       validation and saving
 
   `config.json`                       User configuration
+
+  `deploy.py`                         Hash-based updater: copies changed
+                                      files to the Pico and restarts it
 
   `calibration.data`                  ADC calibration (slope/offset).
                                       Created on the device at first
@@ -192,17 +197,33 @@ Change the serial device name as appropriate for your system.
 ### Updating the firmware
 
 Once the unit is configured, its `config.json` holds your real settings
-and `calibration.data` holds its calibration. When updating, copy only
-the changed `.py` files so neither is overwritten:
+and `calibration.data` holds its calibration. Use `deploy.py` to update
+the code without overwriting either:
 
 ``` bash
-mpremote connect /dev/cu.usbmodem1451201 fs cp main.py :main.py
-mpremote connect /dev/cu.usbmodem1451201 reset
+./deploy.py --init --port /dev/cu.usbmodem1451201   # once per board
+./deploy.py                                         # every update after that
 ```
 
-Any `mpremote` command, even `fs ls`, stops the running logger, so
-always finish with `reset`. `mpremote soft-reset` is not enough: it
-leaves the board at the raw REPL and `main.py` does not start.
+The device stores a manifest (`.deploy-manifest.json`) with the SHA-256
+of each deployed file (`main.py`, `ble_console.py`, `config_manager.py`).
+`deploy.py` finds the board that holds this project's manifest, copies
+only the files whose hashes have changed, writes the new manifest and
+restarts the board. It never overwrites `config.json` or
+`calibration.data`. With `--init`, `config.json` is copied only if the
+board has none.
+
+Other options: `--dry-run` (report changes only), `--force` (copy every
+file), `--list` (show connected boards without touching them) and
+`--port` (skip the search). The logger's USB serial number is cached
+in `.deploy-device`, which is git-ignored, so other MicroPython boards
+are not interrupted on later runs.
+
+Any `mpremote` command, even reading a file, stops the running logger,
+so `deploy.py` always restarts the board, even when nothing changed. If
+you use `mpremote` by hand, finish with `reset`. `mpremote soft-reset`
+is not enough: it leaves the board at the raw REPL and `main.py` does
+not start.
 
 ## Initial Configuration
 
@@ -348,6 +369,19 @@ This design keeps RAM usage bounded while retaining approximately 24
 hours of measurements. Minimum voltage is stored separately from the
 average so short voltage dips are less likely to disappear through
 averaging.
+
+## Status LED
+
+The Pico W's on-board LED shows the network state:
+
+-   **Flashing** (about twice a second): connecting to Wi-Fi, waiting
+    for the first NTP time sync, or the connection has dropped and the
+    logger is retrying
+-   **Steady on**: Wi-Fi connected and the clock set by NTP, so
+    readings are being stored with valid timestamps
+
+The LED is updated from the main loop, so it may pause briefly during a
+long operation such as an NTP request.
 
 ## Time Synchronisation
 

@@ -7,7 +7,7 @@ import gc
 import json
 import machine
 
-from machine import ADC, RTC
+from machine import ADC, RTC, Pin
 from config_manager import load as load_config, save as save_config, defaults as default_config, validate as validate_config
 
 
@@ -68,6 +68,9 @@ rtc = RTC()
 wlan = None
 server = None
 ble_console = None
+status_led = None
+led_is_on = False
+led_toggle_ticks = 0
 
 clock_valid = False
 last_ntp_sync_unix = 0
@@ -696,6 +699,44 @@ def service_ble():
 
 
 # ============================================================
+# Status LED
+# ============================================================
+
+LED_FLASH_MS = 250
+
+
+def start_status_led():
+    global status_led
+    try:
+        # On the Pico W the on-board LED is driven by the CYW43 chip.
+        status_led = Pin("LED", Pin.OUT)
+        status_led.off()
+    except Exception as e:
+        status_led = None
+        print("Status LED unavailable:", e)
+
+
+def service_led():
+    # Steady once Wi-Fi is up and the clock has been set by NTP;
+    # flashing at any other time (connecting, retrying, waiting for NTP).
+    global led_toggle_ticks, led_is_on
+    if status_led is None:
+        return
+
+    if clock_valid and wlan and wlan.isconnected():
+        if not led_is_on:
+            led_is_on = True
+            status_led.on()
+        return
+
+    now = time.ticks_ms()
+    if time.ticks_diff(now, led_toggle_ticks) >= LED_FLASH_MS:
+        led_toggle_ticks = now
+        led_is_on = not led_is_on
+        status_led.value(led_is_on)
+
+
+# ============================================================
 # Wi-Fi
 # ============================================================
 
@@ -716,6 +757,7 @@ def connect_wifi():
 
     while not wlan.isconnected():
         service_sampling()
+        service_led()
 
         if time.ticks_diff(time.ticks_ms(), start) > 20000:
             print("Wi-Fi connection timed out")
@@ -1658,6 +1700,7 @@ def main():
     last_sample_ticks = time.ticks_ms()
     last_record_ticks = last_sample_ticks
 
+    start_status_led()
     start_ble_console()
     ensure_data_file()
 
@@ -1678,6 +1721,7 @@ def main():
     while True:
         sample_if_due()
         service_ble()
+        service_led()
 
         now_ticks = time.ticks_ms()
 
