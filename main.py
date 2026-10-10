@@ -26,7 +26,11 @@ import json
 import time
 import machine
 
-UPDATABLE_FILES = ("app.py", "ble_console.py", "config_manager.py")
+UPDATABLE_FILES = (
+    "app.py", "ble_console.py", "config_manager.py",
+    "index.html", "calibrate.html", "update.html", "settings.html",
+    "ui.css", "ui.js",
+)
 STATE_FILE = "update_state.json"
 READY_FILE = "update_ready.json"
 ROLLBACK_REQUEST_FILE = "update_rollback.json"

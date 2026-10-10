@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Firmware update - Pico Voltage Logger</title>
+<link rel="stylesheet" href="/ui.css">
+</head>
+<body data-page="update" data-title="Firmware update">
+<main>
+<div class="card">
+  <h2>Status</h2>
+  <table class="kv">
+    <tr><td>State</td><td id="state">--</td></tr>
+    <tr><td>Version</td><td id="version">--</td></tr>
+    <tr><td>Rollback available</td><td id="previous">--</td></tr>
+    <tr><td>Updates</td><td id="enabled">--</td></tr>
+    <tr><td>Watchdog</td><td id="watchdog">--</td></tr>
+  </table>
+  <div class="small" id="reason"></div>
+</div>
+
+<div class="card">
+  <h2>Upload package</h2>
+  <p class="small" style="margin-top:0">Choose a <code>.pvlpkg</code> file built with
+  <code>make_package.py</code>. The logger checks its signature, stages the files and
+  reboots. The new version is confirmed after it has run for a minute with the web
+  server up; if it fails first, the logger rolls back to the previous version.</p>
+  <div class="row">
+    <input type="file" id="pkg" accept=".pvlpkg" aria-label="Update package">
+    <button class="btn primary" onclick="upload()">Upload and install</button>
+  </div>
+  <div id="action" style="margin-top:12px"></div>
+</div>
+</main>
+
+<script src="/ui.js"></script>
+<script>
+const STATES={none:'No update installed',pending:'Pending confirmation',good:'Confirmed',
+  rolled_back:'Rolled back',usb_deployed:'Deployed over USB'};
+
+async function loadStatus(){
+  try{
+    const d=await (await fetch('/api/update/status',{cache:'no-store'})).json();
+    document.getElementById('state').textContent=STATES[d.state]||d.state;
+    document.getElementById('version').textContent=d.version||'--';
+    document.getElementById('previous').textContent=d.previous.length?d.previous.join(', '):'no';
+    document.getElementById('enabled').innerHTML=d.enabled?'<span class="ok">✓ enabled</span>':
+      '<span class="bad">✕ disabled: set update_key over BLE</span>';
+    document.getElementById('watchdog').textContent=d.watchdog||'--';
+    document.getElementById('reason').textContent=d.reason?('Reason: '+d.reason):'';
+    return d;
+  }catch(e){return null;}
+}
+
+async function upload(){
+  const f=document.getElementById('pkg').files[0];
+  const a=document.getElementById('action');
+  if(!f){a.innerHTML='<span class="bad">Choose a package first.</span>';return;}
+  a.textContent='Uploading '+f.name+' ('+f.size+' bytes)...';
+  try{
+    const r=await fetch('/api/update',{method:'POST',body:f});
+    const d=await r.json();
+    if(!d.ok)throw new Error(d.error||('HTTP '+r.status));
+    a.innerHTML='<span class="ok">Installed '+(d.version||'')+' ('+d.files.join(', ')+
+      '). Rebooting; this page will show when the update is confirmed.</span>';
+    waitForConfirm();
+  }catch(e){a.innerHTML='<span class="bad">Upload failed: '+e.message+'</span>';}
+}
+
+function waitForConfirm(){
+  const a=document.getElementById('action');
+  const start=Date.now();
+  const t=setInterval(async()=>{
+    const d=await loadStatus();
+    if(d&&d.state==='good'){clearInterval(t);a.innerHTML='<span class="ok">✓ Update confirmed.</span>';}
+    else if(d&&d.state==='rolled_back'){clearInterval(t);
+      a.innerHTML='<span class="bad">The new version failed and was rolled back: '+d.reason+'</span>';}
+    else if(Date.now()-start>300000){clearInterval(t);
+      a.innerHTML='<span class="bad">No confirmation after 5 minutes; check update-status over BLE.</span>';}
+  },5000);
+}
+
+loadStatus();
+</script>
+</body>
+</html>

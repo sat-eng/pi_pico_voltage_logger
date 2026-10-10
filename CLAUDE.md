@@ -24,6 +24,7 @@ mpremote connect /dev/cu.usbmodemXXXX fs cp main.py :main.py
 mpremote connect /dev/cu.usbmodemXXXX fs cp app.py :app.py
 mpremote connect /dev/cu.usbmodemXXXX fs cp ble_console.py :ble_console.py
 mpremote connect /dev/cu.usbmodemXXXX fs cp config_manager.py :config_manager.py
+mpremote connect /dev/cu.usbmodemXXXX fs cp index.html calibrate.html update.html settings.html ui.css ui.js :
 mpremote connect /dev/cu.usbmodemXXXX fs cp config.json :config.json
 mpremote connect /dev/cu.usbmodemXXXX reset
 ```
@@ -53,8 +54,12 @@ after the program is interrupted, which breaks `mpremote`/`deploy.py` sessions. 
 
 Memory is the main constraint on new features: the README's "Memory budget" section has measured
 figures (about 85 KB of RAM free while logging out of about 188 KB; about 510 KB of flash free).
-The web pages live in RAM as string constants in `app.py`. If they need to grow much more,
-consider serving them from files in flash.
+MicroPython compiles a `.py` module in RAM at import, so module source size is a limit of its
+own. `app.py` at about 100 KB failed with `MemoryError` at `import app`, and splitting the pages
+into a second module failed the same way (an 8.5 KB string on a fragmented heap). The web pages
+are therefore plain files in flash (`index.html`, `calibrate.html`, `update.html`,
+`settings.html`, `ui.css`, `ui.js`), streamed by `send_page()`/`send_file()`. Keep `app.py` well
+under 100 KB; if it grows a lot, move code into another module or precompile with `mpy-cross`.
 
 There is no local way to "run" this project off-device; verifying changes means flashing to a
 Pico W (or reasoning carefully about MicroPython semantics, which differ from CPython — see
@@ -107,7 +112,7 @@ under CPython with stubbed `machine`/`time` modules.
   silently ignore or mis-type it (this is why `localecho` was once dropped on every `save`).
   `validate()` also caps `history_seconds` at `MAX_HISTORY_RECORDS` (20,000) records, because the
   history file is created at full size, and replaces non-finite thresholds with defaults. A new
-  key also needs an entry in the Settings page's field list (`F` in `SETTINGS_HTML`) if it should
+  key also needs an entry in the Settings page's field list (`F` in `settings.html`) if it should
   be editable on the web.
 
 - **`ble_console.py`** — a minimal Nordic UART Service (NUS) BLE terminal, framework-free
@@ -187,7 +192,7 @@ missing or out of range (`valid_calibration()`), `DEFAULT_CAL_SLOPE`/`DEFAULT_CA
 used and written out to create the file. `save_calibration()` uses the same temp-file + `.bak`
 pattern as `config_manager.save()`. `apply_calibration()` updates the globals at runtime, so a
 new calibration takes effect without a reboot (`raw_to_mv()` reads the globals on each call).
-The least-squares fit runs in the browser (`CAL_HTML`); the device only captures raw averages and
+The least-squares fit runs in the browser (`calibrate.html`); the device only captures raw averages and
 validates/stores the result. Calibration deliberately stays out of `config.json`/`config_manager`.
 
 ### Time handling
@@ -203,23 +208,31 @@ don't replace this with a timezone library call, none is available on-device.
 Hand-rolled over raw `socket`, not a framework. Requests are parsed minimally (`parse_request`
 reads the request line and skips headers, keeping only `Content-Length`). Responses are streamed
 in small chunks via `send_all()`/`send_headers()` rather than building full strings in memory,
-for the same low-RAM reason as the ring buffer. The web UI lives in string constants in
-`app.py`: `HTML` (dashboard), `CAL_HTML` (calibration), `UPDATE_HTML` (firmware update) and
-`SETTINGS_HTML`, plus `UI_CSS` and `UI_JS`, which all pages share via `/ui.css` and `/ui.js`.
-`UI_JS` builds the header, the
+for the same low-RAM reason as the ring buffer. The web UI is in top-level files mapped by
+`PAGE_FILES`/`ASSET_FILES`: `index.html` (dashboard), `calibrate.html`, `update.html` (firmware
+update) and `settings.html`, plus `ui.css` and `ui.js`, which all pages share via `/ui.css` and
+`/ui.js`. `ui.js` builds the header, the
 slide-out menu (including "Clear stored data") and toasts; pages set
 `<body data-page=… data-title=…>` and call `ui.setStatus()`/`ui.toast()`. Colours are CSS custom
 properties with a `prefers-color-scheme: dark` set; the dashboard's Chart.js colours are read from
-them in `applyChartTheme()` (with fallbacks). `send_page()` streams pages in slices and inserts
-`?v=<UI_VERSION>` after the asset URLs as it goes; the assets are sent with a one-day
-`max-age`, so later page loads skip them. There are no separate template or static-asset files.
+them in `applyChartTheme()` (with fallbacks). `send_page()` streams a page line by line and
+inserts `?v=<UI_VERSION>` (a hash of `ui.css`+`ui.js`, computed at import) after the asset URLs;
+`send_file()` sends the assets with a one-day `max-age`, so later page loads skip them.
 **Don't build large strings at import or per request** (e.g. `str.replace` on a whole page):
 after the pages grew to ~32 KB, an 11 KB allocation at import raised `MemoryError` on the
 fragmented heap (the update rolled back). Work in slices instead. `server.listen(5)` lets a page
 load's parallel requests queue, since connections are served one at a time. Large JSON is
 hand-assembled with f-string-style formatting and the `json_string()` escaper, not `json.dumps`,
 to avoid building a large in-memory structure before sending (`json.dumps` is used only for small
-replies such as update status).
+replies such as update status). `/api/data` is the dashboard's hot path, and its cost is CPU on
+the RP2040 (measured: `str.format` with five ints ≈ 460 µs, `%` ≈ 210 µs, a UK-time
+`format_datetime` ≈ 850 µs, a `read_epoch` ≈ 400 µs). So its graph, table and event records are
+integer arrays (`[epoch, avg_mV, min_mV, max_mV(, samples)]`) built with `%` formatting. The
+browser formats times (`Intl`, `Europe/London`) and event reasons. The response goes through
+`SendBuffer` (about 1 KB sends), and `stream_events()` keeps an incremental cache
+(`event_epochs`/`event_scan_epoch`, reset by `clear_history()`), so polls don't rescan the whole
+history. On the page, `refreshData()` aborts any in-flight request, so a click isn't queued
+behind a poll.
 
 ### BLE command surface
 

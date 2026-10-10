@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Build a signed over-the-air update package for the Pico voltage logger.
 
-The package carries app.py, ble_console.py and/or config_manager.py
-(main.py, the bootstrap, can only be updated over USB with deploy.py).
+The package carries any of UPDATABLE_FILES: the Python modules and the web
+pages/assets (main.py, the bootstrap, can only be updated over USB with
+deploy.py).
 It is signed with HMAC-SHA256 using the key in .update-key, which must
 match the device's update_key setting.
 
@@ -39,7 +40,11 @@ import urllib.request
 # Repository root: the firmware files, key and caches live there; this
 # script lives in tools/.
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-UPDATABLE_FILES = ["app.py", "ble_console.py", "config_manager.py"]
+UPDATABLE_FILES = [
+    "app.py", "ble_console.py", "config_manager.py",
+    "index.html", "calibrate.html", "update.html", "settings.html",
+    "ui.css", "ui.js",
+]
 MAGIC = b"PVLPKG1"
 KEY_FILE = os.path.join(REPO, ".update-key")
 MAX_PACKAGE_BYTES = 256 * 1024     # must match app.py

@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Calibrate - Pico Voltage Logger</title>
+<link rel="stylesheet" href="/ui.css">
+</head>
+<body data-page="calibrate" data-title="Calibrate ADC">
+<main>
+<div class="tiles">
+  <div class="tile hero">
+    <div class="label">Live voltage</div>
+    <div class="value"><span id="liveV">--</span><span class="unit">V</span></div>
+    <div class="small">Raw ADC <span id="liveRaw">--</span></div>
+  </div>
+  <div class="tile wide" style="--tile:var(--accent)">
+    <div class="label">Current calibration <span id="curSource" style="text-transform:none;letter-spacing:0;font-weight:400"></span></div>
+    <div class="value" style="font-size:1.15rem;margin-top:8px">Vin = <span id="curSlope">--</span> &times; ADC + <span id="curOffset">--</span></div>
+    <div class="small">Factory default: <span id="defSlope">--</span> &times; ADC + <span id="defOffset">--</span></div>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Reference points</h2>
+  <ol class="small" style="margin:0 0 12px;padding-left:20px">
+    <li>Connect a variable supply to the logger input.</li>
+    <li>Set it to roughly the target voltage and measure it with a multimeter.</li>
+    <li>Enter the multimeter reading as <b>Actual V</b>, then press <b>Capture</b>.
+        Keep the supply steady while it samples.</li>
+    <li>Repeat for each row (at least two), then press <b>Calculate</b>.</li>
+  </ol>
+  <div class="scroll" style="max-height:none">
+  <table class="pts">
+    <thead><tr><th>Target</th><th>Actual V</th><th></th><th>Raw ADC</th>
+      <th>Noise (min&ndash;max)</th><th>Fitted V</th><th>Error</th></tr></thead>
+    <tbody id="points"></tbody>
+  </table>
+  </div>
+  <div class="row" style="margin-top:12px">
+    <button class="btn" onclick="addPoint()">Add point</button>
+    <button class="btn primary" onclick="calculate()">Calculate</button>
+  </div>
+  <div id="result" style="margin-top:12px"></div>
+  <div class="row" style="margin-top:12px">
+    <button class="btn primary" id="saveBtn" onclick="saveCal()" disabled>Save new calibration</button>
+    <button class="btn danger" onclick="resetCal()">Restore factory default</button>
+    <span id="action"></span>
+  </div>
+</div>
+</main>
+
+<script src="/ui.js"></script>
+<script>
+let points=[3,6,9,12].map(t=>({target:t,actual:t,raw:null,lo:null,hi:null}));
+let fit=null;
+
+function fmt(x,d){return x===null||x===undefined?'--':Number(x).toFixed(d);}
+
+function drawPoints(){
+  let h='';
+  points.forEach((p,i)=>{
+    let fv='--',err='--',cls='';
+    if(fit&&p.raw!==null){
+      const v=fit.slope*p.raw+fit.offset, e=v-p.actual;
+      fv=v.toFixed(3);err=(e>=0?'+':'')+e.toFixed(3);
+      cls=Math.abs(e)<0.05?'ok':'bad';
+    }
+    h+='<tr><td>'+p.target+' V</td>'+
+      '<td><input type="number" step="0.001" style="width:7em;text-align:right" value="'+p.actual+'" '+
+      'aria-label="Actual volts for '+p.target+' V point" onchange="setActual('+i+',this.value)"></td>'+
+      '<td><button class="btn" onclick="capture('+i+',this)">Capture</button></td>'+
+      '<td>'+fmt(p.raw,1)+'</td>'+
+      '<td>'+(p.lo===null?'--':p.lo+'&ndash;'+p.hi)+'</td>'+
+      '<td>'+fv+'</td><td class="'+cls+'">'+err+'</td></tr>';
+  });
+  document.getElementById('points').innerHTML=h;
+}
+
+function setActual(i,v){points[i].actual=Number(v);fit=null;drawPoints();
+  document.getElementById('saveBtn').disabled=true;}
+
+function addPoint(){
+  const t=prompt('Target voltage for the new point?','14');
+  if(t===null||isNaN(Number(t)))return;
+  points.push({target:Number(t),actual:Number(t),raw:null,lo:null,hi:null});
+  drawPoints();
+}
+
+async function capture(i,btn){
+  btn.disabled=true;btn.textContent='Sampling...';
+  try{
+    const r=await fetch('/api/raw',{cache:'no-store'});
+    if(!r.ok)throw new Error('HTTP '+r.status);
+    const d=await r.json();
+    Object.assign(points[i],{raw:d.raw,lo:d.min,hi:d.max});
+    fit=null;document.getElementById('saveBtn').disabled=true;
+  }catch(e){ui.toast('Capture failed: '+e.message);}
+  drawPoints();
+}
+
+function calculate(){
+  const p=points.filter(x=>x.raw!==null&&!isNaN(x.actual));
+  const res=document.getElementById('result');
+  if(p.length<2){res.innerHTML='<span class="bad">Capture at least two points.</span>';return;}
+  // Least-squares straight line: actual = slope*raw + offset.
+  const n=p.length;
+  const mx=p.reduce((s,x)=>s+x.raw,0)/n, my=p.reduce((s,x)=>s+x.actual,0)/n;
+  let sxy=0,sxx=0;
+  p.forEach(x=>{sxy+=(x.raw-mx)*(x.actual-my);sxx+=(x.raw-mx)*(x.raw-mx);});
+  if(sxx===0){res.innerHTML='<span class="bad">Points have identical ADC readings.</span>';return;}
+  const slope=sxy/sxx, offset=my-slope*mx;
+  if(!(slope>1e-6&&slope<1e-2&&offset>-5&&offset<5)){
+    res.innerHTML='<span class="bad">Result out of range (slope '+slope+
+      ', offset '+offset+'). Check the readings.</span>';
+    fit=null;drawPoints();return;
+  }
+  fit={slope:slope,offset:offset};
+  let worst=0;
+  p.forEach(x=>{worst=Math.max(worst,Math.abs(slope*x.raw+offset-x.actual));});
+  res.innerHTML='New: Vin = <b>'+slope.toPrecision(6)+'</b> &times; ADC + <b>'+
+    offset.toFixed(5)+'</b><br><span class="small">Worst-case error at the reference points: '+
+    worst.toFixed(3)+' V</span>';
+  document.getElementById('saveBtn').disabled=false;
+  drawPoints();
+}
+
+async function saveCal(){
+  if(!fit||!confirm('Save and apply the new calibration?'))return;
+  await post('/api/calibration?slope='+fit.slope.toPrecision(10)+
+    '&offset='+fit.offset.toPrecision(10),'Calibration saved');
+}
+
+async function resetCal(){
+  if(!confirm('Restore the factory default calibration?'))return;
+  await post('/api/calibration/reset','Factory default restored');
+}
+
+async function post(u,msg){
+  try{
+    const r=await fetch(u,{method:'POST'});
+    const d=await r.json();
+    if(!r.ok||!d.ok)throw new Error(d.error||('HTTP '+r.status));
+    ui.toast(msg);
+    loadCurrent();
+  }catch(e){ui.toast('Failed: '+e.message);}
+}
+
+async function loadCurrent(){
+  try{
+    const d=await (await fetch('/api/calibration',{cache:'no-store'})).json();
+    document.getElementById('curSlope').textContent=d.slope.toPrecision(6);
+    document.getElementById('curOffset').textContent=d.offset.toFixed(5);
+    document.getElementById('curSource').textContent=
+      d.source==='file'?'(calibrated)':'(factory default)';
+    document.getElementById('defSlope').textContent=d.default_slope.toPrecision(6);
+    document.getElementById('defOffset').textContent=d.default_offset.toFixed(5);
+  }catch(e){}
+}
+
+let liveBusy=false;
+async function refreshLive(){
+  if(liveBusy)return;
+  liveBusy=true;
+  try{
+    const d=await (await fetch('/api/live',{cache:'no-store'})).json();
+    document.getElementById('liveV').textContent=d.volts.toFixed(3);
+    document.getElementById('liveRaw').textContent=d.raw;
+  }catch(e){}finally{liveBusy=false;}
+}
+
+drawPoints();
+loadCurrent();
+refreshLive();
+setInterval(refreshLive,1000);
+</script>
+</body>
+</html>

@@ -48,8 +48,12 @@ MAX_RECORDS = HISTORY_SECONDS // RECORD_SECONDS
 HTTP_PORT = CONFIG["http_port"]
 NTP_RESYNC_SECONDS = CONFIG["ntp_resync_seconds"]
 
+EVENT_LOW_ENABLED = CONFIG["event_low_enabled"]
 EVENT_LOW_VOLTAGE = CONFIG["event_low_voltage"]
+EVENT_EXCURSION_ENABLED = CONFIG["event_excursion_enabled"]
 EVENT_DROP_VOLTS = CONFIG["event_drop_volts"]
+EVENT_LOW_MV = int(EVENT_LOW_VOLTAGE * 1000)
+EVENT_DROP_MV = int(EVENT_DROP_VOLTS * 1000)
 MAX_EVENTS = CONFIG["max_events"]
 MAX_TABLE_ROWS = CONFIG["max_table_rows"]
 MAX_GRAPH_POINTS = CONFIG["max_graph_points"]
@@ -89,6 +93,12 @@ latest_avg_mv = 0
 latest_min_mv = 0
 latest_max_mv = 0
 latest_sample_count = 0
+
+# Epochs of the newest MAX_EVENTS events (newest first), found by scanning
+# history up to event_scan_epoch (0 = rescan). Only records newer than that
+# are scanned on later requests, instead of the whole buffer every poll.
+event_epochs = []
+event_scan_epoch = 0
 
 # ============================================================
 # Time
@@ -179,13 +189,6 @@ def format_datetime(unix_epoch):
     return "{:02d}/{:02d}/{:04d} {:02d}:{:02d}:{:02d}".format(
         t[2], t[1], t[0], t[3], t[4], t[5]
     )
-
-
-def format_time(unix_epoch):
-    if not unix_epoch:
-        return "--"
-    t = local_tuple(unix_epoch)
-    return "{:02d}:{:02d}:{:02d}".format(t[3], t[4], t[5])
 
 
 def sync_ntp():
@@ -441,6 +444,7 @@ def read_epoch(f, epoch):
 def find_latest_record():
     global latest_epoch, latest_avg_mv, latest_min_mv
     global latest_max_mv, latest_sample_count
+    global event_epochs, event_scan_epoch
 
     if not clock_valid:
         return
@@ -449,6 +453,9 @@ def find_latest_record():
     oldest = now - HISTORY_SECONDS
 
     best = None
+    # Events are collected in the same pass, so the first dashboard load
+    # does not have to scan the whole history again.
+    events = []
 
     with open(DATA_FILE, "rb") as f:
         for slot in range(MAX_RECORDS):
@@ -456,6 +463,11 @@ def find_latest_record():
             if r and oldest <= r[0] <= now + RECORD_SECONDS:
                 if best is None or r[0] > best[0]:
                     best = r
+                if is_event(r):
+                    events.append(r[0])
+                    if len(events) >= 2 * MAX_EVENTS:
+                        events.sort(reverse=True)
+                        events = events[:MAX_EVENTS]
             if (slot & 63) == 0:
                 service_sampling()
 
@@ -465,6 +477,9 @@ def find_latest_record():
         latest_min_mv = best[2]
         latest_max_mv = best[3]
         latest_sample_count = best[4]
+        events.sort(reverse=True)
+        event_epochs = events[:MAX_EVENTS]
+        event_scan_epoch = latest_epoch
 
 
 def record_interval():
@@ -515,6 +530,7 @@ def record_interval():
 def clear_history():
     global latest_epoch, latest_avg_mv, latest_min_mv
     global latest_max_mv, latest_sample_count
+    global event_epochs, event_scan_epoch
 
     with open(DATA_FILE, "r+b") as f:
         zero = bytes(256)
@@ -531,6 +547,8 @@ def clear_history():
     latest_min_mv = 0
     latest_max_mv = 0
     latest_sample_count = 0
+    event_epochs = []
+    event_scan_epoch = 0
     gc.collect()
 
 
@@ -658,8 +676,12 @@ def ble_welcome():
 
     ssid = CONFIG.get("wifi_ssid", "")
     ntp = CONFIG.get("ntp_server", "")
-    low = CONFIG.get("event_low_voltage", EVENT_LOW_VOLTAGE)
-    drop = CONFIG.get("event_drop_volts", EVENT_DROP_VOLTS)
+    low = "{} V".format(CONFIG.get("event_low_voltage", EVENT_LOW_VOLTAGE))
+    if not CONFIG.get("event_low_enabled", True):
+        low = "off"
+    drop = "{} V".format(CONFIG.get("event_drop_volts", EVENT_DROP_VOLTS))
+    if not CONFIG.get("event_excursion_enabled", False):
+        drop = "off"
 
     return (
         "Pico Voltage Logger\r\n"
@@ -668,8 +690,8 @@ def ble_welcome():
         "Wi-Fi      : {}\r\n"
         "NTP server : {}\r\n"
         "Clock      : {}\r\n"
-        "Event low  : {} V\r\n"
-        "Event delta: {} V\r\n"
+        "Event low  : {}\r\n"
+        "Event delta: {}\r\n"
         "\r\n"
         "Quick commands:\r\n"
         "  status              current logger status\r\n"
@@ -804,6 +826,31 @@ def send_all(client, data):
         service_sampling()
 
 
+class SendBuffer:
+    # Stands in for the socket in send_all() and collects small writes into
+    # larger sends: one send per JSON record made /api/data take seconds.
+    def __init__(self, client, size=1024):
+        self.client = client
+        self.buf = bytearray(size)
+        self.n = 0
+
+    def send(self, data):
+        n = len(data)
+        if self.n + n > len(self.buf):
+            self.flush()
+        if n > len(self.buf):
+            send_all(self.client, data)
+        else:
+            self.buf[self.n:self.n + n] = data
+            self.n += n
+        return n
+
+    def flush(self):
+        if self.n:
+            send_all(self.client, memoryview(self.buf)[:self.n])
+            self.n = 0
+
+
 def send_headers(client, content_type="application/json",
                  status="200 OK", cache=False, max_age=0):
     send_all(client, "HTTP/1.1 {}\r\n".format(status))
@@ -839,6 +886,10 @@ def query_value(query, key, default=None):
 ALLOWED_WINDOWS = (600, 1800, 3600, 10800, 21600, 43200, 86400)
 
 
+# Records read per flash access when building the graph.
+GRAPH_READ_RECORDS = 32
+
+
 def stream_graph(client, window_seconds, end_epoch):
     if latest_epoch == 0:
         send_all(client, "[]")
@@ -865,6 +916,11 @@ def stream_graph(client, window_seconds, end_epoch):
 
     send_all(client, "[")
 
+    # Consecutive slots are read in blocks: one seek and read per record
+    # made a 24-hour graph take several seconds.
+    buf = bytearray(GRAPH_READ_RECORDS * RECORD_SIZE)
+    mv = memoryview(buf)
+
     with open(DATA_FILE, "rb") as f:
         bucket_start = start_epoch - (start_epoch % RECORD_SECONDS)
         t = bucket_start
@@ -875,43 +931,42 @@ def stream_graph(client, window_seconds, end_epoch):
             b_min = 65535
             b_max = 0
             b_epoch = 0
+            left = stride
 
-            for _ in range(stride):
-                if t > end_epoch:
-                    break
+            while left > 0 and t <= end_epoch:
+                slot = slot_for_epoch(t)
+                n = min(left, GRAPH_READ_RECORDS, MAX_RECORDS - slot,
+                        (end_epoch - t) // RECORD_SECONDS + 1)
+                f.seek(slot * RECORD_SIZE)
+                got = (f.readinto(mv[:n * RECORD_SIZE]) or 0) // RECORD_SIZE
 
-                r = read_epoch(f, t)
+                for i in range(got):
+                    # Same checks as read_epoch().
+                    r = struct.unpack_from(RECORD_FORMAT, buf, i * RECORD_SIZE)
+                    e = t + i * RECORD_SECONDS
+                    if (r[0] and abs(r[0] - e) <= RECORD_SECONDS and
+                            start_epoch <= r[0] <= end_epoch):
+                        b_count += 1
+                        b_sum += r[1]
+                        if r[2] < b_min:
+                            b_min = r[2]
+                        if r[3] > b_max:
+                            b_max = r[3]
+                        if not b_epoch:
+                            b_epoch = r[0]
 
-                if r and start_epoch <= r[0] <= end_epoch:
-                    b_count += 1
-                    b_sum += r[1]
-                    if r[2] < b_min:
-                        b_min = r[2]
-                    if r[3] > b_max:
-                        b_max = r[3]
-                    if not b_epoch:
-                        b_epoch = r[0]
-
-                t += RECORD_SECONDS
+                t += n * RECORD_SECONDS
+                left -= n
                 service_sampling()
 
             if b_count:
                 avg = b_sum // b_count
 
-                if not first:
-                    send_all(client, ",")
+                # % formatting is about twice as fast as str.format here.
+                send_all(client, "%s[%d,%d,%d,%d]" % (
+                    "" if first else ",", b_epoch, avg, b_min, b_max
+                ))
                 first = False
-
-                send_all(client,
-                    '{{"epoch":{},"time":{},"avg":{:.3f},'
-                    '"min":{:.3f},"max":{:.3f}}}'.format(
-                        b_epoch,
-                        json_string(format_time(b_epoch)),
-                        avg / 1000.0,
-                        b_min / 1000.0,
-                        b_max / 1000.0
-                    )
-                )
 
     send_all(client, "]")
 
@@ -936,21 +991,10 @@ def stream_table(client, center_epoch):
             r = read_epoch(f, epoch)
 
             if r:
-                if not first:
-                    send_all(client, ",")
+                send_all(client, "%s[%d,%d,%d,%d,%d]" % (
+                    "" if first else ",", r[0], r[1], r[2], r[3], r[4]
+                ))
                 first = False
-
-                send_all(client,
-                    '{{"epoch":{},"time":{},"avg":{:.3f},'
-                    '"min":{:.3f},"max":{:.3f},"samples":{}}}'.format(
-                        r[0],
-                        json_string(format_datetime(r[0])),
-                        r[1] / 1000.0,
-                        r[2] / 1000.0,
-                        r[3] / 1000.0,
-                        r[4]
-                    )
-                )
 
             service_sampling()
 
@@ -960,65 +1004,66 @@ def stream_table(client, center_epoch):
 def is_event(r):
     if not r:
         return False
-    return (r[2] < int(EVENT_LOW_VOLTAGE * 1000) or
-            (r[3] - r[2]) >= int(EVENT_DROP_VOLTS * 1000))
+    return ((EVENT_LOW_ENABLED and r[2] < EVENT_LOW_MV) or
+            (EVENT_EXCURSION_ENABLED and r[3] - r[2] >= EVENT_DROP_MV))
+
+
+def update_event_cache(f):
+    global event_epochs, event_scan_epoch
+
+    if latest_epoch < event_scan_epoch:
+        # The clock moved backwards: the cached scan no longer fits.
+        event_epochs = []
+        event_scan_epoch = 0
+
+    stop = latest_epoch - MAX_RECORDS * RECORD_SECONDS
+    if not (EVENT_LOW_ENABLED or EVENT_EXCURSION_ENABLED):
+        stop = latest_epoch             # detection off: nothing to scan
+    if event_scan_epoch > stop:
+        stop = event_scan_epoch
+
+    # Scan newest backwards to the previous scan, at most MAX_EVENTS.
+    found = []
+    epoch = latest_epoch
+    while epoch > stop and len(found) < MAX_EVENTS:
+        if is_event(read_epoch(f, epoch)):
+            found.append(epoch)
+        epoch -= RECORD_SECONDS
+        service_sampling()
+
+    if found:
+        event_epochs = (found + event_epochs)[:MAX_EVENTS]
+    event_scan_epoch = latest_epoch
 
 
 def stream_events(client):
     first = True
-    count = 0
     send_all(client, "[")
 
     if latest_epoch:
         with open(DATA_FILE, "rb") as f:
-            epoch = latest_epoch
+            update_event_cache(f)
 
-            # Scan newest backwards and stop after MAX_EVENTS.
-            for _ in range(MAX_RECORDS):
-                if count >= MAX_EVENTS:
-                    break
-
+            for epoch in event_epochs:
+                # Re-check: the slot may have been overwritten since.
                 r = read_epoch(f, epoch)
+                if not is_event(r):
+                    continue
 
-                if is_event(r):
-                    reason = ""
-
-                    if r[2] < int(EVENT_LOW_VOLTAGE * 1000):
-                        reason = "Low {:.3f} V".format(r[2] / 1000.0)
-
-                    excursion = r[3] - r[2]
-
-                    if excursion >= int(EVENT_DROP_VOLTS * 1000):
-                        if reason:
-                            reason += " / "
-                        reason += "Excursion {:.3f} V".format(
-                            excursion / 1000.0
-                        )
-
-                    if not first:
-                        send_all(client, ",")
-                    first = False
-
-                    send_all(client,
-                        '{{"epoch":{},"time":{},"avg":{:.3f},'
-                        '"min":{:.3f},"max":{:.3f},"reason":{}}}'.format(
-                            r[0],
-                            json_string(format_datetime(r[0])),
-                            r[1] / 1000.0,
-                            r[2] / 1000.0,
-                            r[3] / 1000.0,
-                            json_string(reason)
-                        )
-                    )
-                    count += 1
-
-                epoch -= RECORD_SECONDS
+                send_all(client, "%s[%d,%d,%d,%d]" % (
+                    "" if first else ",", r[0], r[1], r[2], r[3]
+                ))
+                first = False
                 service_sampling()
 
     send_all(client, "]")
 
 
 def stream_api(client, query):
+    # graph, table and events are arrays of plain integers (Unix epoch, then
+    # millivolts): [epoch, avg, min, max], plus samples in table rows. The
+    # browser formats times and event reasons; formatting floats and UK times
+    # here took several milliseconds per record on the RP2040.
     try:
         window = int(query_value(query, "window", "3600"))
     except:
@@ -1054,7 +1099,12 @@ def stream_api(client, query):
     send_all(client, '"latest_min":{:.3f},'.format(latest_min_mv / 1000.0))
     send_all(client, '"latest_max":{:.3f},'.format(latest_max_mv / 1000.0))
     send_all(client, '"latest_samples":{},'.format(latest_sample_count))
+    send_all(client, '"record_seconds":{},'.format(RECORD_SECONDS))
+    send_all(client, '"event_low_enabled":{},'.format(
+        "true" if EVENT_LOW_ENABLED else "false"))
     send_all(client, '"event_low_voltage":{:.3f},'.format(EVENT_LOW_VOLTAGE))
+    send_all(client, '"event_excursion_enabled":{},'.format(
+        "true" if EVENT_EXCURSION_ENABLED else "false"))
     send_all(client, '"event_drop_volts":{:.3f},'.format(EVENT_DROP_VOLTS))
 
     # Return text range labels from the Pico. JavaScript therefore never
@@ -1097,7 +1147,11 @@ def stream_api(client, query):
 #   the files' bytes, concatenated in header order
 # ============================================================
 
-UPDATABLE_FILES = ("app.py", "ble_console.py", "config_manager.py")
+UPDATABLE_FILES = (
+    "app.py", "ble_console.py", "config_manager.py",
+    "index.html", "calibrate.html", "update.html", "settings.html",
+    "ui.css", "ui.js",
+)
 UPDATE_STATE_FILE = "update_state.json"
 UPDATE_READY_FILE = "update_ready.json"
 ROLLBACK_REQUEST_FILE = "update_rollback.json"
@@ -1484,937 +1538,76 @@ def apply_settings(changes):
 
 
 # ============================================================
-# Web page
+# Web pages
 # ============================================================
 
-HTML = r'''<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Pico Voltage Logger</title>
-<link rel="stylesheet" href="/ui.css">
-<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-</head>
-<body data-page="dashboard" data-title="Pico Voltage Logger">
-<main>
-<div class="tiles">
-  <div class="tile hero stale" id="liveTile">
-    <div class="label">Live voltage</div>
-    <div class="value"><span id="live">--</span><span class="unit">V</span></div>
-    <div class="small">Instant reading, every second</div>
-  </div>
-  <div class="tile" style="--tile:var(--accent)">
-    <div class="label">Average</div>
-    <div class="value"><span id="avg">--</span><span class="unit">V</span></div>
-  </div>
-  <div class="tile" style="--tile:var(--band)">
-    <div class="label">Minimum</div>
-    <div class="value"><span id="min">--</span><span class="unit">V</span></div>
-  </div>
-  <div class="tile" style="--tile:var(--band)">
-    <div class="label">Maximum</div>
-    <div class="value"><span id="max">--</span><span class="unit">V</span></div>
-  </div>
-  <div class="tile">
-    <div class="label">Samples / 10 s</div>
-    <div class="value"><span id="samples">--</span></div>
-  </div>
-</div>
-
-<div class="card">
-  <div class="toolbar">
-    <h2>Voltage history</h2>
-    <div class="seg" role="group" aria-label="Time window">
-      <button data-window="600">10 min</button><button data-window="1800">30 min</button>
-      <button data-window="3600">1 h</button><button data-window="10800">3 h</button>
-      <button data-window="21600">6 h</button><button data-window="43200">12 h</button>
-      <button data-window="86400">24 h</button>
-    </div>
-  </div>
-  <div class="toolbar">
-    <span class="small" id="range"></span>
-    <div class="seg" role="group" aria-label="Navigate">
-      <button onclick="back()">&lsaquo; Earlier</button>
-      <button onclick="forward()">Later &rsaquo;</button>
-      <button onclick="goNow()">Now</button>
-    </div>
-  </div>
-  <div id="chartWrap"><canvas id="chart" role="img" aria-label="Voltage history: average with minimum to maximum range"></canvas></div>
-  <div class="small" style="margin-top:8px">Click the chart to centre the measurements table on that time.</div>
-</div>
-
-<div class="grid2">
-  <div class="card">
-    <h2>Detected events</h2>
-    <div class="small" style="margin-bottom:10px">Minimum below <b id="lowThreshold">--</b> V or a
-      10-second excursion of at least <b id="dropThreshold">--</b> V. Select an event to centre it.</div>
-    <div class="scroll" id="events"><div class="empty">No events detected.</div></div>
-  </div>
-  <div class="card">
-    <h2>Measurements</h2>
-    <div class="scroll" id="tableScroll">
-      <table>
-        <thead><tr><th>Time</th><th>Average</th><th>Minimum</th><th>Maximum</th><th>Samples</th></tr></thead>
-        <tbody id="measurementTable"></tbody>
-      </table>
-    </div>
-  </div>
-</div>
-</main>
-
-<script src="/ui.js"></script>
-<script>
-let graphWindow=3600, graphEnd=0, tableCenter=0, selectedEpoch=0, lastData=null;
-const css=n=>getComputedStyle(document.documentElement).getPropertyValue(n).trim();
-function rgba(hex,a){const v=parseInt(hex.slice(1),16);
-  return 'rgba('+(v>>16&255)+','+(v>>8&255)+','+(v&255)+','+a+')';}
-
-let voltageChart=null;
-if(window.Chart){
-  Chart.defaults.font.family='system-ui,-apple-system,"Segoe UI",Roboto,sans-serif';
-  voltageChart=new Chart(document.getElementById('chart'),{
-    type:'line',
-    data:{labels:[],datasets:[
-      {label:'Maximum',data:[],pointRadius:0,borderWidth:1,fill:false},
-      {label:'Minimum',data:[],pointRadius:0,borderWidth:1,fill:'-1'},
-      {label:'Average',data:[],pointRadius:0,pointHoverRadius:4,borderWidth:2},
-      {label:'Low threshold',data:[],pointRadius:0,borderWidth:1.5,borderDash:[6,4]}
-    ]},
-    options:{
-      responsive:true,maintainAspectRatio:false,animation:false,
-      interaction:{mode:'index',intersect:false},
-      onClick:function(event,elements,chart){
-        const p=chart.getElementsAtEventForMode(event,'index',{intersect:false},false);
-        if(!p.length||!lastData)return;
-        const g=lastData.graph[p[0].index];
-        if(g)selectGraphPoint(g.epoch);
-      },
-      plugins:{
-        legend:{position:'bottom',onClick:()=>{},labels:{usePointStyle:true,boxWidth:24,
-          generateLabels:c=>Chart.defaults.plugins.legend.labels.generateLabels(c)
-            .filter(l=>l.datasetIndex!==0)
-            .map(l=>{if(l.datasetIndex===1){l.text='Min to max range';l.pointStyle='rect';
-              l.fillStyle=c.data.datasets[1].backgroundColor;}else{l.pointStyle='line';}return l;})}},
-        tooltip:{callbacks:{label:c=>' '+c.dataset.label+': '+Number(c.parsed.y).toFixed(3)+' V'}}
-      },
-      scales:{x:{ticks:{maxTicksLimit:innerWidth<520?4:8,maxRotation:0}},
-              y:{title:{display:true,text:'Voltage (V)'}}}
-    }
-  });
-  applyChartTheme();
-  window.addEventListener('load',()=>{applyChartTheme();voltageChart.update();});
-  if(window.matchMedia)matchMedia('(prefers-color-scheme: dark)')
-    .addEventListener('change',()=>{applyChartTheme();voltageChart.update();});
-}else{
-  document.getElementById('chartWrap').innerHTML='<div class="empty">The chart needs Chart.js, '+
-    'which loads from the internet. Events and measurements still work offline.</div>';
+# The pages, stylesheet and script are files in flash (index.html,
+# calibrate.html, update.html, settings.html, ui.css, ui.js), streamed as
+# they are sent. Held as string constants they took about 45 KB of RAM, and
+# app.py with them inlined no longer compiled on the Pico's heap.
+PAGE_FILES = {
+    "/": "index.html",
+    "/calibrate": "calibrate.html",
+    "/update": "update.html",
+    "/settings": "settings.html",
 }
-
-function applyChartTheme(){
-  const dark=window.matchMedia&&matchMedia('(prefers-color-scheme: dark)').matches;
-  const acc=css('--accent')||(dark?'#3987e5':'#2a78d6'),crit=css('--crit')||'#d03b3b',
-    ink2=css('--ink-2')||(dark?'#c3c7d0':'#4d5260'),muted=css('--muted')||'#7d828d',
-    line=css('--line')||(dark?'#2b303b':'#e1e5ee');
-  const d=voltageChart.data.datasets;
-  d[0].borderColor=rgba(acc,.45);
-  d[1].borderColor=rgba(acc,.45);d[1].backgroundColor=rgba(acc,.16);
-  d[2].borderColor=acc;d[2].backgroundColor=acc;
-  d[3].borderColor=crit;
-  const o=voltageChart.options;
-  o.plugins.legend.labels.color=ink2;
-  for(const k of ['x','y']){o.scales[k].grid={color:line};o.scales[k].border={color:line};
-    o.scales[k].ticks.color=muted;}
-  o.scales.y.title.color=muted;
+ASSET_FILES = {
+    "/ui.css": ("ui.css", "text/css; charset=utf-8"),
+    "/ui.js": ("ui.js", "application/javascript; charset=utf-8"),
 }
-
-function updateButtons(){
-  document.querySelectorAll('[data-window]').forEach(b=>{
-    const on=Number(b.dataset.window)===graphWindow;
-    b.classList.toggle('active',on);b.setAttribute('aria-pressed',on?'true':'false');
-  });
-}
-document.querySelectorAll('[data-window]').forEach(b=>{
-  b.onclick=function(){graphWindow=Number(this.dataset.window);
-    graphEnd=0;tableCenter=0;selectedEpoch=0;updateButtons();refreshData();};
-});
-
-function back(){
-  const base=graphEnd||(lastData?lastData.latest_epoch:0);
-  if(base){graphEnd=Math.floor(base-graphWindow*0.8);refreshData();}
-}
-function forward(){
-  if(!lastData||!graphEnd)return;
-  graphEnd=Math.floor(graphEnd+graphWindow*0.8);
-  if(graphEnd>=lastData.latest_epoch)graphEnd=0;
-  refreshData();
-}
-function goNow(){graphEnd=0;tableCenter=0;selectedEpoch=0;refreshData();}
-
-function scrollTableToEpoch(epoch){
-  const rows=Array.from(document.querySelectorAll('#measurementTable tr[data-epoch]'));
-  if(!rows.length)return;
-  let nearest=rows[0],d=Math.abs(Number(nearest.dataset.epoch)-epoch);
-  rows.forEach(r=>{const nd=Math.abs(Number(r.dataset.epoch)-epoch);
-    if(nd<d){nearest=r;d=nd;}r.classList.remove('sel');});
-  nearest.classList.add('sel');
-  const sc=document.getElementById('tableScroll');
-  sc.scrollTop=nearest.offsetTop-sc.clientHeight/2+nearest.clientHeight/2;
-}
-function selectGraphPoint(epoch){
-  tableCenter=epoch;selectedEpoch=epoch;
-  refreshData().then(()=>setTimeout(()=>scrollTableToEpoch(epoch),80));
-}
-function selectEvent(epoch){
-  selectedEpoch=epoch;tableCenter=epoch;graphEnd=Math.floor(epoch+graphWindow/2);
-  refreshData().then(()=>{
-    document.getElementById('chartWrap').scrollIntoView({behavior:'smooth',block:'center'});
-    setTimeout(()=>scrollTableToEpoch(epoch),150);
-  });
-}
-
-function setText(id,v){document.getElementById(id).textContent=v;}
-function render(data){
-  lastData=data;
-  ui.setStatus(data.clock_valid?'Logging · '+(data.now_text||'').slice(-8):'Waiting for NTP',
-    data.clock_valid?'good':'warn');
-  const has=data.latest_epoch>0;
-  setText('avg',has?data.latest_avg.toFixed(3):'--');
-  setText('min',has?data.latest_min.toFixed(3):'--');
-  setText('max',has?data.latest_max.toFixed(3):'--');
-  setText('samples',has?data.latest_samples:'--');
-  setText('lowThreshold',data.event_low_voltage.toFixed(2));
-  setText('dropThreshold',data.event_drop_volts.toFixed(2));
-  setText('range',has?data.range_start_text+' – '+data.range_end_text:'No data recorded yet');
-
-  if(voltageChart){
-    const ds=voltageChart.data.datasets;
-    voltageChart.data.labels=data.graph.map(x=>x.time);
-    ds[0].data=data.graph.map(x=>x.max);
-    ds[1].data=data.graph.map(x=>x.min);
-    ds[2].data=data.graph.map(x=>x.avg);
-    ds[3].data=data.graph.map(()=>data.event_low_voltage);
-    voltageChart.update();
-  }
-
-  let th='';
-  data.table.forEach(r=>{
-    th+='<tr data-epoch="'+r.epoch+'"'+(r.epoch===selectedEpoch?' class="sel"':'')+'>'+
-      '<td>'+r.time+'</td><td>'+r.avg.toFixed(3)+'</td><td>'+r.min.toFixed(3)+'</td>'+
-      '<td>'+r.max.toFixed(3)+'</td><td>'+r.samples+'</td></tr>';
-  });
-  document.getElementById('measurementTable').innerHTML=th||
-    '<tr><td colspan="5" class="empty">No measurements yet.</td></tr>';
-
-  let eh='';
-  data.events.forEach(e=>{
-    const low=e.reason.indexOf('Low')===0;
-    eh+='<div class="event" role="button" tabindex="0" onclick="selectEvent('+e.epoch+')" '+
-      'onkeydown="if(event.key===\'Enter\')selectEvent('+e.epoch+')">'+
-      '<span class="ico" aria-hidden="true">'+(low?'▼':'↕')+'</span><div>'+
-      '<b>'+e.reason+'</b><div class="small">'+e.time+'<br>avg '+e.avg.toFixed(3)+
-      ' · min '+e.min.toFixed(3)+' · max '+e.max.toFixed(3)+' V</div></div></div>';
-  });
-  document.getElementById('events').innerHTML=eh||'<div class="empty">No events detected.</div>';
-}
-
-async function refreshData(){
-  try{
-    let u='/api/data?window='+graphWindow;
-    if(graphEnd>0)u+='&end='+graphEnd;
-    if(tableCenter>0)u+='&table_center='+tableCenter;
-    const r=await fetch(u,{cache:'no-store'});
-    if(!r.ok)throw new Error('HTTP '+r.status);
-    const d=await r.json();
-    render(d);
-    return d;
-  }catch(e){ui.setStatus('Connection lost','crit');}
-}
-
-let liveBusy=false;
-async function refreshLive(){
-  if(liveBusy)return;
-  liveBusy=true;
-  const tile=document.getElementById('liveTile');
-  try{
-    const r=await fetch('/api/live',{cache:'no-store'});
-    if(!r.ok)throw new Error('HTTP '+r.status);
-    const d=await r.json();
-    setText('live',d.volts.toFixed(3));
-    tile.classList.remove('stale');
-  }catch(e){tile.classList.add('stale');}
-  finally{liveBusy=false;}
-}
-
-document.addEventListener('datacleared',goNow);
-updateButtons();
-refreshData();
-refreshLive();
-setInterval(refreshData,10000);
-setInterval(refreshLive,1000);
-</script>
-</body>
-</html>
-'''
-
-
-CAL_HTML = r'''<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Calibrate - Pico Voltage Logger</title>
-<link rel="stylesheet" href="/ui.css">
-</head>
-<body data-page="calibrate" data-title="Calibrate ADC">
-<main>
-<div class="tiles">
-  <div class="tile hero">
-    <div class="label">Live voltage</div>
-    <div class="value"><span id="liveV">--</span><span class="unit">V</span></div>
-    <div class="small">Raw ADC <span id="liveRaw">--</span></div>
-  </div>
-  <div class="tile wide" style="--tile:var(--accent)">
-    <div class="label">Current calibration <span id="curSource" style="text-transform:none;letter-spacing:0;font-weight:400"></span></div>
-    <div class="value" style="font-size:1.15rem;margin-top:8px">Vin = <span id="curSlope">--</span> &times; ADC + <span id="curOffset">--</span></div>
-    <div class="small">Factory default: <span id="defSlope">--</span> &times; ADC + <span id="defOffset">--</span></div>
-  </div>
-</div>
-
-<div class="card">
-  <h2>Reference points</h2>
-  <ol class="small" style="margin:0 0 12px;padding-left:20px">
-    <li>Connect a variable supply to the logger input.</li>
-    <li>Set it to roughly the target voltage and measure it with a multimeter.</li>
-    <li>Enter the multimeter reading as <b>Actual V</b>, then press <b>Capture</b>.
-        Keep the supply steady while it samples.</li>
-    <li>Repeat for each row (at least two), then press <b>Calculate</b>.</li>
-  </ol>
-  <div class="scroll" style="max-height:none">
-  <table class="pts">
-    <thead><tr><th>Target</th><th>Actual V</th><th></th><th>Raw ADC</th>
-      <th>Noise (min&ndash;max)</th><th>Fitted V</th><th>Error</th></tr></thead>
-    <tbody id="points"></tbody>
-  </table>
-  </div>
-  <div class="row" style="margin-top:12px">
-    <button class="btn" onclick="addPoint()">Add point</button>
-    <button class="btn primary" onclick="calculate()">Calculate</button>
-  </div>
-  <div id="result" style="margin-top:12px"></div>
-  <div class="row" style="margin-top:12px">
-    <button class="btn primary" id="saveBtn" onclick="saveCal()" disabled>Save new calibration</button>
-    <button class="btn danger" onclick="resetCal()">Restore factory default</button>
-    <span id="action"></span>
-  </div>
-</div>
-</main>
-
-<script src="/ui.js"></script>
-<script>
-let points=[3,6,9,12].map(t=>({target:t,actual:t,raw:null,lo:null,hi:null}));
-let fit=null;
-
-function fmt(x,d){return x===null||x===undefined?'--':Number(x).toFixed(d);}
-
-function drawPoints(){
-  let h='';
-  points.forEach((p,i)=>{
-    let fv='--',err='--',cls='';
-    if(fit&&p.raw!==null){
-      const v=fit.slope*p.raw+fit.offset, e=v-p.actual;
-      fv=v.toFixed(3);err=(e>=0?'+':'')+e.toFixed(3);
-      cls=Math.abs(e)<0.05?'ok':'bad';
-    }
-    h+='<tr><td>'+p.target+' V</td>'+
-      '<td><input type="number" step="0.001" style="width:7em;text-align:right" value="'+p.actual+'" '+
-      'aria-label="Actual volts for '+p.target+' V point" onchange="setActual('+i+',this.value)"></td>'+
-      '<td><button class="btn" onclick="capture('+i+',this)">Capture</button></td>'+
-      '<td>'+fmt(p.raw,1)+'</td>'+
-      '<td>'+(p.lo===null?'--':p.lo+'&ndash;'+p.hi)+'</td>'+
-      '<td>'+fv+'</td><td class="'+cls+'">'+err+'</td></tr>';
-  });
-  document.getElementById('points').innerHTML=h;
-}
-
-function setActual(i,v){points[i].actual=Number(v);fit=null;drawPoints();
-  document.getElementById('saveBtn').disabled=true;}
-
-function addPoint(){
-  const t=prompt('Target voltage for the new point?','14');
-  if(t===null||isNaN(Number(t)))return;
-  points.push({target:Number(t),actual:Number(t),raw:null,lo:null,hi:null});
-  drawPoints();
-}
-
-async function capture(i,btn){
-  btn.disabled=true;btn.textContent='Sampling...';
-  try{
-    const r=await fetch('/api/raw',{cache:'no-store'});
-    if(!r.ok)throw new Error('HTTP '+r.status);
-    const d=await r.json();
-    Object.assign(points[i],{raw:d.raw,lo:d.min,hi:d.max});
-    fit=null;document.getElementById('saveBtn').disabled=true;
-  }catch(e){ui.toast('Capture failed: '+e.message);}
-  drawPoints();
-}
-
-function calculate(){
-  const p=points.filter(x=>x.raw!==null&&!isNaN(x.actual));
-  const res=document.getElementById('result');
-  if(p.length<2){res.innerHTML='<span class="bad">Capture at least two points.</span>';return;}
-  // Least-squares straight line: actual = slope*raw + offset.
-  const n=p.length;
-  const mx=p.reduce((s,x)=>s+x.raw,0)/n, my=p.reduce((s,x)=>s+x.actual,0)/n;
-  let sxy=0,sxx=0;
-  p.forEach(x=>{sxy+=(x.raw-mx)*(x.actual-my);sxx+=(x.raw-mx)*(x.raw-mx);});
-  if(sxx===0){res.innerHTML='<span class="bad">Points have identical ADC readings.</span>';return;}
-  const slope=sxy/sxx, offset=my-slope*mx;
-  if(!(slope>1e-6&&slope<1e-2&&offset>-5&&offset<5)){
-    res.innerHTML='<span class="bad">Result out of range (slope '+slope+
-      ', offset '+offset+'). Check the readings.</span>';
-    fit=null;drawPoints();return;
-  }
-  fit={slope:slope,offset:offset};
-  let worst=0;
-  p.forEach(x=>{worst=Math.max(worst,Math.abs(slope*x.raw+offset-x.actual));});
-  res.innerHTML='New: Vin = <b>'+slope.toPrecision(6)+'</b> &times; ADC + <b>'+
-    offset.toFixed(5)+'</b><br><span class="small">Worst-case error at the reference points: '+
-    worst.toFixed(3)+' V</span>';
-  document.getElementById('saveBtn').disabled=false;
-  drawPoints();
-}
-
-async function saveCal(){
-  if(!fit||!confirm('Save and apply the new calibration?'))return;
-  await post('/api/calibration?slope='+fit.slope.toPrecision(10)+
-    '&offset='+fit.offset.toPrecision(10),'Calibration saved');
-}
-
-async function resetCal(){
-  if(!confirm('Restore the factory default calibration?'))return;
-  await post('/api/calibration/reset','Factory default restored');
-}
-
-async function post(u,msg){
-  try{
-    const r=await fetch(u,{method:'POST'});
-    const d=await r.json();
-    if(!r.ok||!d.ok)throw new Error(d.error||('HTTP '+r.status));
-    ui.toast(msg);
-    loadCurrent();
-  }catch(e){ui.toast('Failed: '+e.message);}
-}
-
-async function loadCurrent(){
-  try{
-    const d=await (await fetch('/api/calibration',{cache:'no-store'})).json();
-    document.getElementById('curSlope').textContent=d.slope.toPrecision(6);
-    document.getElementById('curOffset').textContent=d.offset.toFixed(5);
-    document.getElementById('curSource').textContent=
-      d.source==='file'?'(calibrated)':'(factory default)';
-    document.getElementById('defSlope').textContent=d.default_slope.toPrecision(6);
-    document.getElementById('defOffset').textContent=d.default_offset.toFixed(5);
-  }catch(e){}
-}
-
-let liveBusy=false;
-async function refreshLive(){
-  if(liveBusy)return;
-  liveBusy=true;
-  try{
-    const d=await (await fetch('/api/live',{cache:'no-store'})).json();
-    document.getElementById('liveV').textContent=d.volts.toFixed(3);
-    document.getElementById('liveRaw').textContent=d.raw;
-  }catch(e){}finally{liveBusy=false;}
-}
-
-drawPoints();
-loadCurrent();
-refreshLive();
-setInterval(refreshLive,1000);
-</script>
-</body>
-</html>
-'''
-
-
-# Shared by all three pages (served as /ui.css and /ui.js) so the
-# styling and menu exist once in RAM rather than in every page.
-UI_CSS = r''':root{color-scheme:light;--plane:#eef2f8;--surface:#fff;--surface-2:#f5f7fb;--ink:#151821;--ink-2:#4d5260;--muted:#7d828d;--line:#e1e5ee;--accent:#2a78d6;--band:#86b6ef;--accent-soft:#e7f0fc;--good:#0ca30c;--warn:#fab219;--crit:#d03b3b;--hdr-a:#123f7a;--hdr-b:#2a78d6;--shadow:0 1px 2px rgba(16,24,40,.05),0 6px 18px rgba(16,24,40,.06)}
-@media (prefers-color-scheme:dark){:root{color-scheme:dark;--plane:#0d1015;--surface:#171a21;--surface-2:#1f232c;--ink:#f1f3f7;--ink-2:#c3c7d0;--muted:#8b909b;--line:#2b303b;--accent:#3987e5;--band:#5598e7;--accent-soft:rgba(57,135,229,.16);--hdr-a:#0b2b55;--hdr-b:#1c5cab;--shadow:0 1px 2px rgba(0,0,0,.4)}}
-*{box-sizing:border-box}
-[hidden]{display:none!important}
-body{margin:0;font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;background:var(--plane);color:var(--ink);line-height:1.45;-webkit-text-size-adjust:100%}
-a{color:var(--accent)}
-.topbar{position:sticky;top:0;z-index:20;display:flex;align-items:center;gap:12px;padding:10px 16px;background:linear-gradient(115deg,var(--hdr-a),var(--hdr-b));color:#fff;box-shadow:0 2px 12px rgba(0,0,0,.18)}
-.topbar h1{flex:1;margin:0;font-size:1.05rem;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.icon-btn{display:inline-flex;align-items:center;justify-content:center;width:40px;height:40px;flex:none;border:0;border-radius:10px;background:rgba(255,255,255,.12);color:#fff;cursor:pointer}
-.icon-btn:hover{background:rgba(255,255,255,.24)}
-.icon-btn:focus-visible,.btn:focus-visible,.seg button:focus-visible,.drawer a:focus-visible,.drawer button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
-.pill{display:inline-flex;align-items:center;gap:7px;padding:5px 11px;border-radius:999px;background:rgba(255,255,255,.15);font-size:.85rem;white-space:nowrap;font-variant-numeric:tabular-nums}
-.dot{width:8px;height:8px;border-radius:50%;background:#c3c2b7;flex:none}
-.dot.good{background:#3ad13a}.dot.warn{background:var(--warn)}.dot.crit{background:#ff6b6b}
-.drawer{position:fixed;top:0;bottom:0;left:0;z-index:40;display:flex;flex-direction:column;width:min(290px,86vw);background:var(--surface);box-shadow:6px 0 28px rgba(0,0,0,.25);transform:translateX(-105%);transition:transform .22s ease;visibility:hidden}
-.drawer.open{transform:none;visibility:visible}
-.drawer-head{display:flex;align-items:center;justify-content:space-between;padding:14px 12px 14px 18px;background:linear-gradient(115deg,var(--hdr-a),var(--hdr-b));color:#fff;font-weight:600}
-.drawer nav{padding:10px;overflow-y:auto}
-.drawer a,.drawer button.item{display:flex;align-items:center;gap:12px;width:100%;padding:11px 12px;border:0;border-radius:10px;background:none;color:var(--ink);font:inherit;text-align:left;text-decoration:none;cursor:pointer}
-.drawer a:hover,.drawer button.item:hover{background:var(--surface-2)}
-.drawer a.current{background:var(--accent-soft);color:var(--accent);font-weight:600}
-.drawer svg{flex:none}
-.drawer hr{margin:8px 4px;border:0;border-top:1px solid var(--line)}
-.drawer .danger{color:var(--crit)}
-.drawer .foot{margin-top:auto;padding:12px 18px;font-size:.8rem;color:var(--muted)}
-.scrim{position:fixed;inset:0;z-index:30;background:rgba(8,12,20,.45);opacity:0;pointer-events:none;transition:opacity .22s}
-.scrim.open{opacity:1;pointer-events:auto}
-main{max-width:1180px;margin:0 auto;padding:16px}
-.card{margin-bottom:16px;padding:16px;background:var(--surface);border:1px solid var(--line);border-radius:14px;box-shadow:var(--shadow)}
-.card h2{margin:0 0 10px;font-size:1rem;font-weight:600}
-.small{font-size:.85rem;color:var(--muted)}
-.btn{padding:8px 14px;border:1px solid var(--line);border-radius:10px;background:var(--surface);color:var(--ink);font:inherit;font-size:.9rem;cursor:pointer}
-.btn:hover{background:var(--surface-2)}
-.btn.primary{background:var(--accent);border-color:var(--accent);color:#fff}
-.btn.primary:hover{filter:brightness(1.08)}
-.btn.danger{color:var(--crit)}
-.btn:disabled{opacity:.5;cursor:default;filter:none}
-.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
-.ok{color:var(--good)}.bad{color:var(--crit)}
-table{width:100%;border-collapse:collapse;font-size:.9rem;font-variant-numeric:tabular-nums}
-th,td{padding:8px 10px;border-bottom:1px solid var(--line);text-align:right;white-space:nowrap}
-th:first-child,td:first-child{text-align:left}
-thead th{position:sticky;top:0;background:var(--surface-2);color:var(--ink-2);font-size:.82rem;font-weight:600}
-tbody tr:hover td{background:var(--surface-2)}
-tr.sel td{background:var(--accent-soft)}
-input{font:inherit;color:var(--ink);background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:6px 8px}
-code{font-size:.9em;word-break:break-all}
-.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:16px}
-.tile{position:relative;overflow:hidden;padding:14px 16px 14px 18px;background:var(--surface);border:1px solid var(--line);border-radius:14px;box-shadow:var(--shadow)}
-.tile::before{content:"";position:absolute;top:0;bottom:0;left:0;width:4px;background:var(--tile,var(--line))}
-.tile .label{font-size:.76rem;font-weight:600;letter-spacing:.05em;text-transform:uppercase;color:var(--ink-2)}
-.tile .value{margin-top:4px;font-size:1.75rem;font-weight:650;font-variant-numeric:tabular-nums}
-.unit{margin-left:3px;font-size:.9rem;font-weight:500;color:var(--muted)}
-.tile.hero,.tile.wide{grid-column:span 2}
-.tile.hero{background:linear-gradient(135deg,var(--hdr-b),var(--hdr-a));border:0;color:#fff}
-.tile.hero::before{display:none}
-.tile.hero .label,.tile.hero .unit,.tile.hero .small{color:rgba(255,255,255,.8)}
-.tile.hero .value{font-size:2.6rem;line-height:1.15}
-.tile.stale .value{opacity:.45}
-.toolbar{display:flex;flex-wrap:wrap;gap:8px 12px;align-items:center;justify-content:space-between;margin-bottom:10px}
-.toolbar h2{margin:0}
-.seg{display:inline-flex;flex-wrap:wrap;gap:2px;padding:3px;background:var(--surface-2);border:1px solid var(--line);border-radius:10px}
-.seg button{padding:6px 10px;border:0;border-radius:8px;background:none;color:var(--ink-2);font:inherit;font-size:.84rem;cursor:pointer}
-.seg button:hover{color:var(--ink)}
-.seg button.active{background:var(--surface);color:var(--accent);font-weight:600;box-shadow:0 1px 3px rgba(0,0,0,.14)}
-#chartWrap{position:relative;height:340px}
-.grid2{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.4fr);gap:16px}
-.grid2 .card{margin-bottom:0}
-.scroll{max-height:380px;overflow:auto;border:1px solid var(--line);border-radius:10px}
-.event{display:flex;gap:10px;padding:10px 12px;border-left:3px solid var(--crit);border-bottom:1px solid var(--line);cursor:pointer}
-.event:hover{background:var(--surface-2)}
-.event .ico{color:var(--crit);font-weight:700}
-.empty{padding:28px 16px;text-align:center;color:var(--muted)}
-.kv{width:auto}
-.kv td{text-align:left;padding:6px 14px 6px 0;border:0}
-.kv td:first-child{color:var(--ink-2)}
-.form{display:grid;grid-template-columns:minmax(150px,230px) minmax(0,1fr);gap:12px 18px;align-items:start}
-.form>label{padding-top:7px;font-size:.9rem;color:var(--ink-2)}
-.field input[type=text],.field input[type=password]{width:100%;max-width:340px}
-.field input[type=number]{width:9em}
-.field .hint{margin-top:4px;font-size:.8rem;color:var(--muted)}
-.field .warn{margin-top:4px;font-size:.8rem;color:var(--crit)}
-.field.changed input{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
-.switch{display:inline-flex;align-items:center;gap:8px;padding-top:6px;color:var(--ink)}
-.switch input{width:18px;height:18px;accent-color:var(--accent)}
-.savebar{position:sticky;bottom:12px;z-index:10;display:flex;flex-wrap:wrap;gap:10px;align-items:center;justify-content:space-between;box-shadow:0 6px 24px rgba(16,24,40,.18)}
-.toast{position:fixed;left:50%;bottom:22px;z-index:50;max-width:calc(100% - 32px);padding:10px 16px;border-radius:10px;background:var(--ink);color:var(--surface);box-shadow:var(--shadow);transform:translateX(-50%);opacity:0;pointer-events:none;transition:opacity .2s}
-.toast.show{opacity:1}
-@media (max-width:600px){.form{grid-template-columns:minmax(0,1fr);gap:4px}.form>label{padding-top:10px}}
-@media (max-width:900px){.grid2{grid-template-columns:minmax(0,1fr)}}
-@media (max-width:520px){.tile.hero,.tile.wide{grid-column:1/-1}.seg button{padding:6px 7px}#chartWrap{height:260px}}
-'''
-
-
-UI_JS = r'''(function(){
-// Shared header, slide-out menu and notifications for every page.
-// A page sets <body data-page="..." data-title="...">.
-const B=document.body,page=B.dataset.page||'';
-const svg=d=>'<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'+d+'</svg>';
-const I={
-  menu:svg('<path d="M4 6h16M4 12h16M4 18h16"/>'),
-  close:svg('<path d="M6 6l12 12M18 6L6 18"/>'),
-  chart:svg('<path d="M3 3v18h18"/><path d="M7 15l4-4 3 3 5-6"/>'),
-  cal:svg('<path d="M12 3v3M12 18v3M3 12h3M18 12h3"/><circle cx="12" cy="12" r="5"/>'),
-  up:svg('<path d="M12 16V4M7 9l5-5 5 5"/><path d="M4 20h16"/>'),
-  gear:svg('<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/>'),
-  trash:svg('<path d="M4 7h16M10 11v6M14 11v6"/><path d="M6 7l1 13h10l1-13M9 7V4h6v3"/>')
-};
-const link=(href,id,icon,text)=>'<a href="'+href+'"'+(page===id?' class="current" aria-current="page"':'')+'>'+icon+text+'</a>';
-
-const hdr=document.createElement('header');
-hdr.className='topbar';
-hdr.innerHTML='<button class="icon-btn" id="menuBtn" aria-label="Open menu" aria-expanded="false" aria-controls="drawer">'+I.menu+'</button>'+
-  '<h1>'+(B.dataset.title||'Pico Voltage Logger')+'</h1>'+
-  '<span class="pill" id="statusPill" hidden><span class="dot" id="statusDot"></span><span class="txt" id="statusText"></span></span>';
-B.prepend(hdr);
-
-const dr=document.createElement('aside');
-dr.className='drawer';dr.id='drawer';dr.setAttribute('aria-label','Menu');
-dr.innerHTML='<div class="drawer-head"><span>Pico Voltage Logger</span>'+
-  '<button class="icon-btn" id="menuClose" aria-label="Close menu">'+I.close+'</button></div>'+
-  '<nav>'+link('/','dashboard',I.chart,'Dashboard')+link('/calibrate','calibrate',I.cal,'Calibrate ADC')+
-  link('/update','update',I.up,'Firmware update')+link('/settings','settings',I.gear,'Settings')+'<hr>'+
-  '<button class="item danger" id="clearBtn">'+I.trash+'Clear stored data</button></nav>'+
-  '<div class="foot">24-hour voltage logger</div>';
-const scrim=document.createElement('div');scrim.className='scrim';
-const toastEl=document.createElement('div');toastEl.className='toast';toastEl.setAttribute('role','status');
-B.append(dr,scrim,toastEl);
-
-const btn=document.getElementById('menuBtn');
-function setOpen(o){
-  dr.classList.toggle('open',o);scrim.classList.toggle('open',o);
-  btn.setAttribute('aria-expanded',o?'true':'false');
-  if(o)(dr.querySelector('a,button.item')||dr).focus();else btn.focus();
-}
-btn.onclick=()=>setOpen(true);
-document.getElementById('menuClose').onclick=()=>setOpen(false);
-scrim.onclick=()=>setOpen(false);
-document.addEventListener('keydown',e=>{if(e.key==='Escape'&&dr.classList.contains('open'))setOpen(false);});
-
-let toastTimer=0;
-function toast(msg){
-  toastEl.textContent=msg;toastEl.classList.add('show');
-  clearTimeout(toastTimer);toastTimer=setTimeout(()=>toastEl.classList.remove('show'),3500);
-}
-
-document.getElementById('clearBtn').onclick=async()=>{
-  setOpen(false);
-  if(!confirm('Clear all stored voltage history? This cannot be undone.'))return;
-  try{
-    const r=await fetch('/api/clear',{method:'POST'});
-    if(!r.ok)throw new Error('HTTP '+r.status);
-    toast('Stored data cleared');
-    document.dispatchEvent(new Event('datacleared'));
-  }catch(e){toast('Clear failed: '+e.message);}
-};
-
-window.ui={
-  toast:toast,
-  setStatus:function(text,kind){
-    document.getElementById('statusPill').hidden=false;
-    document.getElementById('statusText').textContent=text;
-    document.getElementById('statusDot').className='dot '+(kind||'');
-  }
-};
-})();
-'''
-
-
-UPDATE_HTML = r'''<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Firmware update - Pico Voltage Logger</title>
-<link rel="stylesheet" href="/ui.css">
-</head>
-<body data-page="update" data-title="Firmware update">
-<main>
-<div class="card">
-  <h2>Status</h2>
-  <table class="kv">
-    <tr><td>State</td><td id="state">--</td></tr>
-    <tr><td>Version</td><td id="version">--</td></tr>
-    <tr><td>Rollback available</td><td id="previous">--</td></tr>
-    <tr><td>Updates</td><td id="enabled">--</td></tr>
-    <tr><td>Watchdog</td><td id="watchdog">--</td></tr>
-  </table>
-  <div class="small" id="reason"></div>
-</div>
-
-<div class="card">
-  <h2>Upload package</h2>
-  <p class="small" style="margin-top:0">Choose a <code>.pvlpkg</code> file built with
-  <code>make_package.py</code>. The logger checks its signature, stages the files and
-  reboots. The new version is confirmed after it has run for a minute with the web
-  server up; if it fails first, the logger rolls back to the previous version.</p>
-  <div class="row">
-    <input type="file" id="pkg" accept=".pvlpkg" aria-label="Update package">
-    <button class="btn primary" onclick="upload()">Upload and install</button>
-  </div>
-  <div id="action" style="margin-top:12px"></div>
-</div>
-</main>
-
-<script src="/ui.js"></script>
-<script>
-const STATES={none:'No update installed',pending:'Pending confirmation',good:'Confirmed',
-  rolled_back:'Rolled back',usb_deployed:'Deployed over USB'};
-
-async function loadStatus(){
-  try{
-    const d=await (await fetch('/api/update/status',{cache:'no-store'})).json();
-    document.getElementById('state').textContent=STATES[d.state]||d.state;
-    document.getElementById('version').textContent=d.version||'--';
-    document.getElementById('previous').textContent=d.previous.length?d.previous.join(', '):'no';
-    document.getElementById('enabled').innerHTML=d.enabled?'<span class="ok">✓ enabled</span>':
-      '<span class="bad">✕ disabled: set update_key over BLE</span>';
-    document.getElementById('watchdog').textContent=d.watchdog||'--';
-    document.getElementById('reason').textContent=d.reason?('Reason: '+d.reason):'';
-    return d;
-  }catch(e){return null;}
-}
-
-async function upload(){
-  const f=document.getElementById('pkg').files[0];
-  const a=document.getElementById('action');
-  if(!f){a.innerHTML='<span class="bad">Choose a package first.</span>';return;}
-  a.textContent='Uploading '+f.name+' ('+f.size+' bytes)...';
-  try{
-    const r=await fetch('/api/update',{method:'POST',body:f});
-    const d=await r.json();
-    if(!d.ok)throw new Error(d.error||('HTTP '+r.status));
-    a.innerHTML='<span class="ok">Installed '+(d.version||'')+' ('+d.files.join(', ')+
-      '). Rebooting; this page will show when the update is confirmed.</span>';
-    waitForConfirm();
-  }catch(e){a.innerHTML='<span class="bad">Upload failed: '+e.message+'</span>';}
-}
-
-function waitForConfirm(){
-  const a=document.getElementById('action');
-  const start=Date.now();
-  const t=setInterval(async()=>{
-    const d=await loadStatus();
-    if(d&&d.state==='good'){clearInterval(t);a.innerHTML='<span class="ok">✓ Update confirmed.</span>';}
-    else if(d&&d.state==='rolled_back'){clearInterval(t);
-      a.innerHTML='<span class="bad">The new version failed and was rolled back: '+d.reason+'</span>';}
-    else if(Date.now()-start>300000){clearInterval(t);
-      a.innerHTML='<span class="bad">No confirmation after 5 minutes; check update-status over BLE.</span>';}
-  },5000);
-}
-
-loadStatus();
-</script>
-</body>
-</html>
-'''
-
-
-SETTINGS_HTML = r'''<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Settings - Pico Voltage Logger</title>
-<link rel="stylesheet" href="/ui.css">
-</head>
-<body data-page="settings" data-title="Settings">
-<main>
-<div id="groups"><div class="card"><div class="empty">Loading settings...</div></div></div>
-<div class="card savebar">
-  <span class="small" id="dirty">No unsaved changes.</span>
-  <div class="row">
-    <button class="btn" id="discardBtn" onclick="discard()" disabled>Discard</button>
-    <button class="btn" id="saveBtn" onclick="save(false)" disabled>Save</button>
-    <button class="btn primary" id="saveRestartBtn" onclick="save(true)" disabled>Save and restart</button>
-    <button class="btn" onclick="restartOnly()">Restart device</button>
-  </div>
-</div>
-</main>
-
-<script src="/ui.js"></script>
-<script>
-// [key, label, type, options]; a one-element entry starts a group.
-const F=[
- ['Network'],
- ['wifi_ssid','Wi-Fi network (SSID)','text',{}],
- ['wifi_password','Wi-Fi password','password',{hint:'Leave blank to keep the current password.'}],
- ['http_port','Web server port','int',{min:1,max:65535,warn:'After restarting, the page moves to the new port.'}],
- ['Time'],
- ['ntp_server','NTP server','text',{hint:'An IP address avoids DNS delays (needed with the watchdog on).'}],
- ['ntp_resync_seconds','Clock resync interval','int',{min:60,unit:'s',dur:1}],
- ['Logging'],
- ['sample_interval_ms','Sample interval','int',{min:1,unit:'ms'}],
- ['record_interval_ms','Record interval','int',{min:1000,step:1000,unit:'ms',
-   warn:'Changing this erases stored history at restart.'}],
- ['history_seconds','History length','int',{min:60,unit:'s',dur:1,
-   hint:'At most 20,000 records.',warn:'Changing this erases stored history at restart.'}],
- ['Events'],
- ['event_low_voltage','Low-voltage threshold','float',{step:0.01,unit:'V'}],
- ['event_drop_volts','Excursion threshold','float',{min:0,step:0.01,unit:'V'}],
- ['max_events','Events listed','int',{min:1,max:500}],
- ['Display'],
- ['max_table_rows','Measurement table rows','int',{min:10,max:500}],
- ['max_graph_points','Chart points','int',{min:60,max:1440}],
- ['Device'],
- ['device_name','BLE device name','text',{maxlength:24}],
- ['ble_enabled','BLE console','bool',{warn:'With BLE off there is no fallback if Wi-Fi fails.'}],
- ['localecho','BLE command echo','bool',{}],
- ['watchdog_enabled','Permanent watchdog','bool',{warn:'While on, USB/mpremote sessions are reset after about 8 s.'}]
-];
-const META={};F.forEach(f=>{if(f.length>1)META[f[0]]=f;});
-let original={};
-
-function dur(s){s=Number(s);if(!(s>0))return '';
-  return s>=3600?'= '+(s/3600).toFixed(s%3600?1:0)+' h':s>=60?'= '+(s/60).toFixed(s%60?1:0)+' min':'';}
-function esc(v){return String(v).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;');}
-
-function render(cfg){
-  let h='',open=false;
-  F.forEach(f=>{
-    if(f.length===1){if(open)h+='</div></div>';h+='<div class="card"><h2>'+f[0]+'</h2><div class="form">';open=true;return;}
-    const [k,label,type,o]=f, id='f_'+k;
-    let input;
-    if(type==='bool')input='<label class="switch"><input type="checkbox" id="'+id+'"'+(cfg[k]?' checked':'')+'> On</label>';
-    else if(type==='password')input='<input type="password" id="'+id+'" autocomplete="new-password" placeholder="'+
-      (cfg.wifi_password_set?'unchanged':'not set')+'">';
-    else input='<input type="'+(type==='text'?'text':'number')+'" id="'+id+'" value="'+esc(cfg[k])+'"'+
-      (o.min!==undefined?' min="'+o.min+'"':'')+(o.max!==undefined?' max="'+o.max+'"':'')+
-      ' step="'+(o.step||(type==='float'?'any':1))+'"'+(o.maxlength?' maxlength="'+o.maxlength+'"':'')+'>'+
-      (o.unit?'<span class="unit">'+o.unit+'</span>':'')+(o.dur?'<span class="small" id="d_'+k+'"> '+dur(cfg[k])+'</span>':'');
-    h+='<label for="'+id+'">'+label+'</label><div class="field" id="r_'+k+'">'+input+
-      (o.hint?'<div class="hint">'+o.hint+'</div>':'')+(o.warn?'<div class="warn" hidden>⚠ '+o.warn+'</div>':'')+'</div>';
-  });
-  h+='</div></div>';
-  document.getElementById('groups').innerHTML=h;
-  document.querySelectorAll('#groups input').forEach(i=>i.addEventListener('input',update));
-}
-
-function value(k){
-  const el=document.getElementById('f_'+k), t=META[k][2];
-  if(t==='bool')return el.checked;
-  if(t==='int')return el.value===''?NaN:Math.round(Number(el.value));
-  if(t==='float')return el.value===''?NaN:Number(el.value);
-  return el.value;
-}
-
-function changes(){
-  const c={};
-  Object.keys(META).forEach(k=>{
-    const v=value(k);
-    if(META[k][2]==='password'){if(v!=='')c[k]=v;}
-    else if(v!==original[k])c[k]=v;
-  });
-  return c;
-}
-
-function update(){
-  const c=changes(), n=Object.keys(c).length;
-  Object.keys(META).forEach(k=>{
-    const row=document.getElementById('r_'+k), w=row.querySelector('.warn');
-    row.classList.toggle('changed',k in c);
-    if(w)w.hidden=!(k in c);
-    const d=document.getElementById('d_'+k); if(d)d.textContent=' '+dur(value(k));
-  });
-  document.getElementById('dirty').textContent=n?n+' unsaved change'+(n>1?'s':'')+'.':'No unsaved changes.';
-  ['discardBtn','saveBtn','saveRestartBtn'].forEach(id=>document.getElementById(id).disabled=!n);
-}
-
-async function load(){
-  try{
-    const r=await fetch('/api/config',{cache:'no-store'});
-    if(!r.ok)throw new Error('HTTP '+r.status);
-    original=await r.json();
-    render(original);update();
-  }catch(e){document.getElementById('groups').innerHTML=
-    '<div class="card"><div class="empty">Could not load settings: '+e.message+'</div></div>';}
-}
-
-function discard(){render(original);update();}
-
-async function save(restart){
-  const c=changes();
-  for(const k in c){
-    const t=META[k][2];
-    if((t==='int'||t==='float')&&!isFinite(c[k])){ui.toast(META[k][1]+' needs a number');return;}
-  }
-  const warns=Object.keys(c).filter(k=>META[k][3].warn).map(k=>'• '+META[k][1]+': '+META[k][3].warn);
-  const msg=(restart?'Save and restart the logger?':'Save these settings? They take effect at the next restart.')+
-    (warns.length?'\n\n'+warns.join('\n'):'');
-  if(!confirm(msg))return;
-  if(restart)c._restart=true;
-  try{
-    const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(c)});
-    const d=await r.json();
-    if(!d.ok)throw new Error(d.error||('HTTP '+r.status));
-    if(d.adjusted.length)ui.toast('Saved. Adjusted to valid values: '+d.adjusted.map(k=>META[k]?META[k][1]:k).join(', '));
-    else ui.toast(restart?'Saved; restarting...':'Saved. Restart to apply.');
-    if(restart)waitForRestart(c.http_port||null);
-    else load();
-  }catch(e){ui.toast('Save failed: '+e.message);}
-}
-
-async function restartOnly(){
-  if(!confirm('Restart the logger now? It is unavailable for about 20 seconds.'))return;
-  try{await fetch('/api/restart',{method:'POST'});ui.toast('Restarting...');waitForRestart(null);}
-  catch(e){ui.toast('Restart failed: '+e.message);}
-}
-
-function waitForRestart(newPort){
-  document.querySelectorAll('.savebar button').forEach(b=>b.disabled=true);
-  const dirty=document.getElementById('dirty');
-  if(newPort&&String(newPort)!==(location.port||'80')){
-    const url=location.protocol+'//'+location.hostname+(newPort==80?'':':'+newPort)+'/settings';
-    dirty.innerHTML='Restarting. The logger will be at <a href="'+url+'">'+url+'</a>.';
-    return;
-  }
-  dirty.textContent='Restarting... waiting for the logger to come back.';
-  const start=Date.now();
-  setTimeout(function poll(){
-    fetch('/api/live',{cache:'no-store'}).then(r=>{if(r.ok)location.reload();else throw 0;})
-      .catch(()=>{if(Date.now()-start<120000)setTimeout(poll,3000);
-        else dirty.textContent='The logger has not come back after 2 minutes. Check it over BLE.';});
-  },6000);
-}
-
-load();
-</script>
-</body>
-</html>
-'''
 
 
 # Browsers cache /ui.css and /ui.js for a day (fewer requests to this
 # single-connection server). A content hash added to their URLs as pages are
-# sent makes browsers fetch new copies after an update. Hashing in small
-# slices and inserting the tag while streaming avoids copying whole pages,
-# which can fail on a fragmented heap.
+# sent makes browsers fetch new copies after an update.
 def _asset_version():
     h = hashlib.sha256()
-    for text in (UI_CSS, UI_JS):
-        for i in range(0, len(text), 512):
-            h.update(text[i:i + 512].encode())
+    for name in ("ui.css", "ui.js"):
+        try:
+            with open(name, "rb") as f:
+                while True:
+                    chunk = f.read(512)
+                    if not chunk:
+                        break
+                    h.update(chunk)
+        except OSError:
+            pass
     return binascii.hexlify(h.digest()[:4]).decode()
 
 
 UI_VERSION = _asset_version()
-ASSET_URLS = ("/ui.css", "/ui.js")
+ASSET_URLS = (b"/ui.css", b"/ui.js")
+VERSION_TAG = b"?v=" + UI_VERSION.encode()
 
 
-def send_page(client, page, content_type="text/html; charset=utf-8",
-              max_age=0):
-    send_headers(client, content_type, cache=True, max_age=max_age)
+def send_page(client, name):
+    # Line by line, so "?v=<UI_VERSION>" can be added after asset URLs.
+    with open(name, "rb") as f:
+        send_headers(client, "text/html; charset=utf-8", cache=True)
+        out = SendBuffer(client)
+        while True:
+            line = f.readline()
+            if not line:
+                break
+            for url in ASSET_URLS:
+                i = line.find(url)
+                if i >= 0:
+                    i += len(url)
+                    line = line[:i] + VERSION_TAG + line[i:]
+            send_all(out, line)
+        out.flush()
 
-    # Where to insert "?v=<version>" (just after each asset URL).
-    cuts = []
-    for url in ASSET_URLS:
-        i = page.find(url)
-        if i >= 0:
-            cuts.append(i + len(url))
-    cuts.sort()
-    cuts.append(len(page))
 
-    # Avoid page.encode() of the complete page. Send modest slices.
-    pos = 0
-    chunk = 768
-    for cut in cuts:
-        while pos < cut:
-            end = min(pos + chunk, cut)
-            send_all(client, page[pos:end])
-            pos = end
-            gc.collect()
-        if cut < len(page):
-            send_all(client, "?v=" + UI_VERSION)
+def send_file(client, name, content_type, max_age=0):
+    with open(name, "rb") as f:
+        send_headers(client, content_type, cache=True, max_age=max_age)
+        buf = bytearray(768)
+        view = memoryview(buf)
+        while True:
+            n = f.readinto(buf)
+            if not n:
+                break
+            send_all(client, view[:n])
 
 
 # ============================================================
@@ -2466,17 +1659,8 @@ def handle_client(client):
     global reboot_requested
     method, path, query, length = parse_request(client)
 
-    if path == "/":
-        send_page(client, HTML)
-
-    elif path == "/calibrate":
-        send_page(client, CAL_HTML)
-
-    elif path == "/update":
-        send_page(client, UPDATE_HTML)
-
-    elif path == "/settings":
-        send_page(client, SETTINGS_HTML)
+    if path in PAGE_FILES:
+        send_page(client, PAGE_FILES[path])
 
     elif path == "/api/config" and method == "GET":
         send_headers(client)
@@ -2508,12 +1692,9 @@ def handle_client(client):
         send_all(client, '{"ok":true}')
         reboot_requested = True
 
-    elif path == "/ui.css":
-        send_page(client, UI_CSS, "text/css; charset=utf-8", max_age=86400)
-
-    elif path == "/ui.js":
-        send_page(client, UI_JS, "application/javascript; charset=utf-8",
-                  max_age=86400)
+    elif path in ASSET_FILES:
+        name, content_type = ASSET_FILES[path]
+        send_file(client, name, content_type, max_age=86400)
 
     elif path == "/api/update/status":
         send_headers(client)
@@ -2535,7 +1716,9 @@ def handle_client(client):
             reboot_requested = True
 
     elif path == "/api/data":
-        stream_api(client, query)
+        out = SendBuffer(client)
+        stream_api(out, query)
+        out.flush()
 
     elif path == "/api/live":
         raw = read_live_raw()

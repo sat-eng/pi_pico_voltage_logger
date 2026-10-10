@@ -13,7 +13,10 @@ DEFAULTS = {
     "record_interval_ms": 10000,
     "history_seconds": 86400,
     "http_port": 80,
+    # Low-voltage events are on and excursion events off by default.
+    "event_low_enabled": True,
     "event_low_voltage": 11.5,
+    "event_excursion_enabled": False,
     "event_drop_volts": 0.50,
     "max_events": 100,
     "max_table_rows": 100,
@@ -58,6 +61,8 @@ def validate(cfg):
     out["ble_enabled"] = bool(out["ble_enabled"])
     out["localecho"] = bool(out["localecho"])
     out["watchdog_enabled"] = bool(out["watchdog_enabled"])
+    out["event_low_enabled"] = bool(out["event_low_enabled"])
+    out["event_excursion_enabled"] = bool(out["event_excursion_enabled"])
     out["update_key"] = str(out["update_key"]).strip()[:128]
 
     out["sample_interval_ms"] = max(1, int(out["sample_interval_ms"]))

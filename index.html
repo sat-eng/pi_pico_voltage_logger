@@ -1,0 +1,296 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Pico Voltage Logger</title>
+<link rel="stylesheet" href="/ui.css">
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body data-page="dashboard" data-title="Pico Voltage Logger">
+<main>
+<div class="tiles">
+  <div class="tile hero stale" id="liveTile">
+    <div class="label">Live voltage</div>
+    <div class="value"><span id="live">--</span><span class="unit">V</span></div>
+    <div class="small">Instant reading, every second</div>
+  </div>
+  <div class="tile" style="--tile:var(--accent)">
+    <div class="label">Average</div>
+    <div class="value"><span id="avg">--</span><span class="unit">V</span></div>
+  </div>
+  <div class="tile" style="--tile:var(--band)">
+    <div class="label">Minimum</div>
+    <div class="value"><span id="min">--</span><span class="unit">V</span></div>
+  </div>
+  <div class="tile" style="--tile:var(--band)">
+    <div class="label">Maximum</div>
+    <div class="value"><span id="max">--</span><span class="unit">V</span></div>
+  </div>
+  <div class="tile">
+    <div class="label" id="samplesLabel">Samples / 10 s</div>
+    <div class="value"><span id="samples">--</span></div>
+  </div>
+</div>
+
+<div class="card">
+  <div class="toolbar">
+    <h2>Voltage history</h2>
+    <div class="seg" role="group" aria-label="Time window">
+      <button data-window="600">10 min</button><button data-window="1800">30 min</button>
+      <button data-window="3600">1 h</button><button data-window="10800">3 h</button>
+      <button data-window="21600">6 h</button><button data-window="43200">12 h</button>
+      <button data-window="86400">24 h</button>
+    </div>
+  </div>
+  <div class="toolbar">
+    <span class="small" id="range"></span>
+    <div class="seg" role="group" aria-label="Navigate">
+      <button onclick="back()">&lsaquo; Earlier</button>
+      <button onclick="forward()">Later &rsaquo;</button>
+      <button onclick="goNow()">Now</button>
+    </div>
+  </div>
+  <div id="chartWrap"><canvas id="chart" role="img" aria-label="Voltage history: average with minimum to maximum range"></canvas></div>
+  <div class="small" style="margin-top:8px">Click the chart to centre the measurements table on that time.</div>
+</div>
+
+<div class="grid2">
+  <div class="card">
+    <h2>Detected events</h2>
+    <div class="small" style="margin-bottom:10px" id="eventRule">&nbsp;</div>
+    <div class="scroll" id="events"><div class="empty">No events detected.</div></div>
+  </div>
+  <div class="card">
+    <h2>Measurements</h2>
+    <div class="scroll" id="tableScroll">
+      <table>
+        <thead><tr><th>Time</th><th>Average</th><th>Minimum</th><th>Maximum</th><th>Samples</th></tr></thead>
+        <tbody id="measurementTable"></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+</main>
+
+<script src="/ui.js"></script>
+<script>
+let graphWindow=3600, graphEnd=0, tableCenter=0, selectedEpoch=0, lastData=null;
+// /api/data sends Unix epochs and millivolts; times are shown in UK time.
+function ukFormat(o){
+  try{return new Intl.DateTimeFormat('en-GB',Object.assign({timeZone:'Europe/London',
+    hour:'2-digit',minute:'2-digit',second:'2-digit',hourCycle:'h23'},o));}
+  catch(e){return new Intl.DateTimeFormat('en-GB',Object.assign({hour:'2-digit',
+    minute:'2-digit',second:'2-digit',hourCycle:'h23'},o));}
+}
+const timeFmt=ukFormat({}),dateTimeFmt=ukFormat({day:'2-digit',month:'2-digit',year:'numeric'});
+const fmtTime=e=>timeFmt.format(e*1000);
+const fmtDateTime=e=>dateTimeFmt.format(e*1000).replace(',','');
+const volts=mv=>(mv/1000).toFixed(3);
+const css=n=>getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+function rgba(hex,a){const v=parseInt(hex.slice(1),16);
+  return 'rgba('+(v>>16&255)+','+(v>>8&255)+','+(v&255)+','+a+')';}
+
+let voltageChart=null;
+if(window.Chart){
+  Chart.defaults.font.family='system-ui,-apple-system,"Segoe UI",Roboto,sans-serif';
+  voltageChart=new Chart(document.getElementById('chart'),{
+    type:'line',
+    data:{labels:[],datasets:[
+      {label:'Maximum',data:[],pointRadius:0,borderWidth:1,fill:false},
+      {label:'Minimum',data:[],pointRadius:0,borderWidth:1,fill:'-1'},
+      {label:'Average',data:[],pointRadius:0,pointHoverRadius:4,borderWidth:2},
+      {label:'Low threshold',data:[],pointRadius:0,borderWidth:1.5,borderDash:[6,4]}
+    ]},
+    options:{
+      responsive:true,maintainAspectRatio:false,animation:false,
+      interaction:{mode:'index',intersect:false},
+      onClick:function(event,elements,chart){
+        const p=chart.getElementsAtEventForMode(event,'index',{intersect:false},false);
+        if(!p.length||!lastData)return;
+        const g=lastData.graph[p[0].index];
+        if(g)selectGraphPoint(g[0]);
+      },
+      plugins:{
+        legend:{position:'bottom',onClick:()=>{},labels:{usePointStyle:true,boxWidth:24,
+          generateLabels:c=>Chart.defaults.plugins.legend.labels.generateLabels(c)
+            .filter(l=>l.datasetIndex!==0)
+            .map(l=>{if(l.datasetIndex===1){l.text='Min to max range';l.pointStyle='rect';
+              l.fillStyle=c.data.datasets[1].backgroundColor;}else{l.pointStyle='line';}return l;})}},
+        tooltip:{callbacks:{label:c=>' '+c.dataset.label+': '+Number(c.parsed.y).toFixed(3)+' V'}}
+      },
+      scales:{x:{ticks:{maxTicksLimit:innerWidth<520?4:8,maxRotation:0}},
+              y:{title:{display:true,text:'Voltage (V)'}}}
+    }
+  });
+  applyChartTheme();
+  window.addEventListener('load',()=>{applyChartTheme();voltageChart.update();});
+  if(window.matchMedia)matchMedia('(prefers-color-scheme: dark)')
+    .addEventListener('change',()=>{applyChartTheme();voltageChart.update();});
+}else{
+  document.getElementById('chartWrap').innerHTML='<div class="empty">The chart needs Chart.js, '+
+    'which loads from the internet. Events and measurements still work offline.</div>';
+}
+
+function applyChartTheme(){
+  const dark=window.matchMedia&&matchMedia('(prefers-color-scheme: dark)').matches;
+  const acc=css('--accent')||(dark?'#3987e5':'#2a78d6'),crit=css('--crit')||'#d03b3b',
+    ink2=css('--ink-2')||(dark?'#c3c7d0':'#4d5260'),muted=css('--muted')||'#7d828d',
+    line=css('--line')||(dark?'#2b303b':'#e1e5ee');
+  const d=voltageChart.data.datasets;
+  d[0].borderColor=rgba(acc,.45);
+  d[1].borderColor=rgba(acc,.45);d[1].backgroundColor=rgba(acc,.16);
+  d[2].borderColor=acc;d[2].backgroundColor=acc;
+  d[3].borderColor=crit;
+  const o=voltageChart.options;
+  o.plugins.legend.labels.color=ink2;
+  for(const k of ['x','y']){o.scales[k].grid={color:line};o.scales[k].border={color:line};
+    o.scales[k].ticks.color=muted;}
+  o.scales.y.title.color=muted;
+}
+
+function updateButtons(){
+  document.querySelectorAll('[data-window]').forEach(b=>{
+    const on=Number(b.dataset.window)===graphWindow;
+    b.classList.toggle('active',on);b.setAttribute('aria-pressed',on?'true':'false');
+  });
+}
+document.querySelectorAll('[data-window]').forEach(b=>{
+  b.onclick=function(){graphWindow=Number(this.dataset.window);
+    graphEnd=0;tableCenter=0;selectedEpoch=0;updateButtons();refreshData();};
+});
+
+function back(){
+  const base=graphEnd||(lastData?lastData.latest_epoch:0);
+  if(base){graphEnd=Math.floor(base-graphWindow*0.8);refreshData();}
+}
+function forward(){
+  if(!lastData||!graphEnd)return;
+  graphEnd=Math.floor(graphEnd+graphWindow*0.8);
+  if(graphEnd>=lastData.latest_epoch)graphEnd=0;
+  refreshData();
+}
+function goNow(){graphEnd=0;tableCenter=0;selectedEpoch=0;refreshData();}
+
+function scrollTableToEpoch(epoch){
+  const rows=Array.from(document.querySelectorAll('#measurementTable tr[data-epoch]'));
+  if(!rows.length)return;
+  let nearest=rows[0],d=Math.abs(Number(nearest.dataset.epoch)-epoch);
+  rows.forEach(r=>{const nd=Math.abs(Number(r.dataset.epoch)-epoch);
+    if(nd<d){nearest=r;d=nd;}r.classList.remove('sel');});
+  nearest.classList.add('sel');
+  const sc=document.getElementById('tableScroll');
+  sc.scrollTop=nearest.offsetTop-sc.clientHeight/2+nearest.clientHeight/2;
+}
+function selectGraphPoint(epoch){
+  tableCenter=epoch;selectedEpoch=epoch;
+  refreshData().then(d=>{if(d)setTimeout(()=>scrollTableToEpoch(epoch),80);});
+}
+function selectEvent(epoch){
+  selectedEpoch=epoch;tableCenter=epoch;graphEnd=Math.floor(epoch+graphWindow/2);
+  refreshData().then(d=>{
+    if(!d)return;
+    document.getElementById('chartWrap').scrollIntoView({behavior:'smooth',block:'center'});
+    setTimeout(()=>scrollTableToEpoch(epoch),150);
+  });
+}
+
+function setText(id,v){document.getElementById(id).textContent=v;}
+function render(data){
+  lastData=data;
+  ui.setStatus(data.clock_valid?'Logging · '+(data.now_text||'').slice(-8):'Waiting for NTP',
+    data.clock_valid?'good':'warn');
+  const has=data.latest_epoch>0;
+  setText('avg',has?data.latest_avg.toFixed(3):'--');
+  setText('min',has?data.latest_min.toFixed(3):'--');
+  setText('max',has?data.latest_max.toFixed(3):'--');
+  setText('samples',has?data.latest_samples:'--');
+  setText('samplesLabel','Samples / '+data.record_seconds+' s');
+  const rules=[];
+  if(data.event_low_enabled)rules.push('a minimum below <b>'+data.event_low_voltage.toFixed(2)+'</b> V');
+  if(data.event_excursion_enabled)rules.push('a '+data.record_seconds+
+    '-second excursion (maximum minus minimum) of at least <b>'+data.event_drop_volts.toFixed(2)+'</b> V');
+  document.getElementById('eventRule').innerHTML=rules.length?
+    'Records with '+rules.join(' or ')+'. Select an event to centre it.':
+    'Event detection is off. Turn it on in <a href="/settings">Settings</a>.';
+  setText('range',has?data.range_start_text+' – '+data.range_end_text:'No data recorded yet');
+
+  if(voltageChart){
+    const ds=voltageChart.data.datasets;
+    voltageChart.data.labels=data.graph.map(x=>fmtTime(x[0]));
+    ds[0].data=data.graph.map(x=>x[3]/1000);
+    ds[1].data=data.graph.map(x=>x[2]/1000);
+    ds[2].data=data.graph.map(x=>x[1]/1000);
+    ds[3].data=data.graph.map(()=>data.event_low_voltage);
+    voltageChart.update();
+  }
+
+  let th='';
+  data.table.forEach(r=>{
+    th+='<tr data-epoch="'+r[0]+'"'+(r[0]===selectedEpoch?' class="sel"':'')+'>'+
+      '<td>'+fmtDateTime(r[0])+'</td><td>'+volts(r[1])+'</td><td>'+volts(r[2])+'</td>'+
+      '<td>'+volts(r[3])+'</td><td>'+r[4]+'</td></tr>';
+  });
+  document.getElementById('measurementTable').innerHTML=th||
+    '<tr><td colspan="5" class="empty">No measurements yet.</td></tr>';
+
+  let eh='';
+  const lowMv=Math.round(data.event_low_voltage*1000),dropMv=Math.round(data.event_drop_volts*1000);
+  data.events.forEach(e=>{
+    const low=data.event_low_enabled&&e[2]<lowMv,why=[];
+    if(low)why.push('Low '+volts(e[2])+' V');
+    if(data.event_excursion_enabled&&(e[3]-e[2]>=dropMv||!low))why.push('Excursion '+volts(e[3]-e[2])+' V');
+    eh+='<div class="event" role="button" tabindex="0" onclick="selectEvent('+e[0]+')" '+
+      'onkeydown="if(event.key===\'Enter\')selectEvent('+e[0]+')">'+
+      '<span class="ico" aria-hidden="true">'+(low?'▼':'↕')+'</span><div>'+
+      '<b>'+why.join(' / ')+'</b><div class="small">'+fmtDateTime(e[0])+'<br>avg '+volts(e[1])+
+      ' · min '+volts(e[2])+' · max '+volts(e[3])+' V</div></div></div>';
+  });
+  document.getElementById('events').innerHTML=eh||'<div class="empty">No events detected.</div>';
+}
+
+// Each call cancels a request still in flight (a poll or an earlier click),
+// so the logger, which serves one connection at a time, answers the latest
+// view first. The 10 s poll restarts after every completed request.
+let dataCtl=null,dataTimer=0;
+async function refreshData(){
+  if(dataCtl)dataCtl.abort();
+  const ctl=dataCtl=window.AbortController?new AbortController():null;
+  clearTimeout(dataTimer);
+  try{
+    let u='/api/data?window='+graphWindow;
+    if(graphEnd>0)u+='&end='+graphEnd;
+    if(tableCenter>0)u+='&table_center='+tableCenter;
+    const r=await fetch(u,{cache:'no-store',signal:ctl?ctl.signal:undefined});
+    if(!r.ok)throw new Error('HTTP '+r.status);
+    const d=await r.json();
+    if(ctl&&ctl.signal.aborted)return;
+    render(d);
+    return d;
+  }catch(e){if(!(ctl&&ctl.signal.aborted))ui.setStatus('Connection lost','crit');}
+  finally{if(dataCtl===ctl){dataCtl=null;dataTimer=setTimeout(refreshData,10000);}}
+}
+
+let liveBusy=false;
+async function refreshLive(){
+  if(liveBusy)return;
+  liveBusy=true;
+  const tile=document.getElementById('liveTile');
+  try{
+    const r=await fetch('/api/live',{cache:'no-store'});
+    if(!r.ok)throw new Error('HTTP '+r.status);
+    const d=await r.json();
+    setText('live',d.volts.toFixed(3));
+    tile.classList.remove('stale');
+  }catch(e){tile.classList.add('stale');}
+  finally{liveBusy=false;}
+}
+
+document.addEventListener('datacleared',goNow);
+updateButtons();
+refreshData();
+refreshLive();
+setInterval(refreshLive,1000);
+</script>
+</body>
+</html>

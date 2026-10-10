@@ -41,7 +41,11 @@ import time
 PROJECT = "pi_pico_voltage_logger"
 MANIFEST_NAME = ".deploy-manifest.json"
 DEVICE_CACHE = ".deploy-device"     # local, untracked: last known board serial
-MANAGED_FILES = ["main.py", "app.py", "ble_console.py", "config_manager.py"]
+MANAGED_FILES = [
+    "main.py", "app.py", "ble_console.py", "config_manager.py",
+    "index.html", "calibrate.html", "update.html", "settings.html",
+    "ui.css", "ui.js",
+]
 INIT_ONLY_IF_MISSING = ["config.json"]
 
 # Run on the device after a USB deploy: drop over-the-air backups and any
@@ -49,7 +53,8 @@ INIT_ONLY_IF_MISSING = ["config.json"]
 # what was just deployed. The replay-protection timestamp is kept.
 CLEAR_OTA_STATE = """
 import os, json
-for n in ('app.py', 'ble_console.py', 'config_manager.py'):
+for n in ('app.py', 'ble_console.py', 'config_manager.py', 'index.html',
+          'calibrate.html', 'update.html', 'settings.html', 'ui.css', 'ui.js'):
     for s in ('.old', '.new'):
         try: os.remove(n + s)
         except OSError: pass

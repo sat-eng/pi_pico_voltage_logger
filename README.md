@@ -17,12 +17,13 @@ when an appropriate input divider and protection circuit are used.
 -   Raspberry Pi Pico W / MicroPython
 -   ADC voltage sampling on GP26 / ADC0
 -   Calibrated ADC-to-voltage conversion
--   Fixed-size binary ring buffer for approximately 24 hours of history
+-   Fixed-size binary ring buffer holding up to 20,000 records (24
+    hours by default, adjustable from about a day to two months)
 -   Low RAM usage: history is not retained as thousands of Python
     objects
 -   Browser-based live voltage display
 -   Historical graph with selectable time windows
--   Event detection for low-voltage and sudden voltage-drop conditions
+-   Event detection for low voltage and, optionally, voltage excursions
 -   NTP time synchronisation
 -   On-board LED status: flashing until Wi-Fi is connected and the
     clock is set by NTP, then steady
@@ -54,6 +55,10 @@ on the Pico.
                                       history, web server, event
                                       detection, BLE command handling
                                       and over-the-air update receiver
+
+  `index.html`, `calibrate.html`,      The web pages, stylesheet and
+  `update.html`, `settings.html`,     script, served from flash
+  `ui.css`, `ui.js`
 
   `ble_console.py`                    Nordic UART Service BLE terminal
                                       implementation
@@ -206,6 +211,7 @@ mpremote connect /dev/cu.usbmodem1451201 fs cp main.py :main.py
 mpremote connect /dev/cu.usbmodem1451201 fs cp app.py :app.py
 mpremote connect /dev/cu.usbmodem1451201 fs cp ble_console.py :ble_console.py
 mpremote connect /dev/cu.usbmodem1451201 fs cp config_manager.py :config_manager.py
+mpremote connect /dev/cu.usbmodem1451201 fs cp index.html calibrate.html update.html settings.html ui.css ui.js :
 mpremote connect /dev/cu.usbmodem1451201 fs cp config.json :config.json
 mpremote connect /dev/cu.usbmodem1451201 reset
 ```
@@ -224,8 +230,8 @@ tools/deploy.py                                         # every update after tha
 ```
 
 The device stores a manifest (`.deploy-manifest.json`) with the SHA-256
-of each deployed file (`main.py`, `app.py`, `ble_console.py`,
-`config_manager.py`).
+of each deployed file (`main.py`, the Python modules and the web
+files).
 `deploy.py` finds the board that holds this project's manifest, copies
 only the files whose hashes have changed, writes the new manifest and
 restarts the board. It never overwrites `config.json` or
@@ -251,7 +257,8 @@ was just deployed.
 ## Over-the-Air Updates
 
 For a logger installed out of reach of USB, `app.py`,
-`ble_console.py` and `config_manager.py` can be updated over Wi-Fi.
+`ble_console.py`, `config_manager.py` and the web files can be updated
+over Wi-Fi.
 `main.py`, the bootstrap that applies updates and recovers from bad
 ones, is deliberately never updated over the air, so a broken remote
 update can always be undone.
@@ -488,15 +495,17 @@ The dashboard shows:
 
 -   **Live voltage**: an instantaneous reading, refreshed every second
     from the lightweight `/api/live` endpoint. It is independent of the
-    10-second logging interval and does not affect recorded data.
+    record interval and does not affect recorded data.
 -   **Average, minimum, maximum and sample count** for the latest
-    10-second record.
+    record (one every 10 seconds by default).
 -   **Voltage history**: the average as a line inside a shaded
     minimum-to-maximum band, with the low-voltage event threshold as a
     dashed line. Choose a window from 10 minutes to 24 hours and step
     earlier or later through the stored history. Clicking the chart
     centres the measurements table on that time.
--   **Detected events** and the **measurements** table.
+-   **Detected events** (the event types turned on in Settings) and the
+    **measurements** table. Selecting an event or a point on the chart,
+    or changing the window, refreshes the view straight away.
 
 The header shows the logger's status (logging, waiting for NTP, or
 connection lost) and the current time. The menu button at the top left
@@ -520,12 +529,23 @@ are adjusted to the nearest valid value, and the page tells you which.
 Some changes warn you and ask for confirmation first:
 
 -   Changing the **record interval** or **history length** erases stored
-    history at restart, because the history file is resized. History is
-    capped at 20,000 records (240 KB of flash).
+    history at restart, because the history file is resized.
 -   Changing the **web server port** moves the page to the new port.
 -   Turning **BLE off** removes the fallback if Wi-Fi fails.
 -   Turning on the **permanent watchdog** affects USB sessions (see
     [Permanent watchdog](#permanent-watchdog-optional)).
+
+The **record interval** and **history length** are a linked pair of
+sliders. Moving either one sets both so that the history holds 20,000
+records (240 KB of flash): from a record every 5 seconds (27.8 hours of
+history) to one every 5 minutes (69 days). A longer interval gives a
+longer history, but each record then averages more samples, so short
+dips show only in its minimum and maximum.
+
+Under **Events**, low-voltage events and excursion events (a record
+whose maximum minus minimum reaches the excursion threshold) each have
+a tick box. Low-voltage events are on and excursion events off by
+default; a threshold can only be edited while its events are on.
 
 The web server has no login, so two settings are protected:
 -   The **Wi-Fi password** is write-only. It is never shown, and leaving
@@ -558,8 +578,7 @@ maximum voltage (mV)
 sample count
 ```
 
-This design keeps RAM usage bounded while retaining approximately 24
-hours of measurements. Minimum voltage is stored separately from the
+This design keeps RAM usage bounded however much history is kept. Minimum voltage is stored separately from the
 average so short voltage dips are less likely to disappear through
 averaging.
 
@@ -571,7 +590,8 @@ runs.
 
 The record interval and history length can be changed (`history_seconds`
 and `record_interval_ms`, on the Settings page or over BLE). History is
-capped at 20,000 records (240 KB), 55 hours at the default interval.
+capped at 20,000 records (240 KB), 55 hours at the default interval. The
+Settings page always sets exactly 20,000 records.
 Changing either setting resizes the file at the next restart, which
 erases the stored history.
 
@@ -587,7 +607,10 @@ Measured on a Pico W running this firmware:
 An over-the-air update needs free flash of at least three times the
 package size plus 32 KB (about 335 KB for a 100 KB update). Note that a
 longer history reduces that headroom. RAM, not logging, is the limit
-for new features: the web pages are held in RAM as part of `app.py`.
+for new features. The web pages are files in flash, streamed as they
+are sent, rather than string constants in `app.py`: with them inlined,
+`app.py` (about 100 KB of source) failed to compile at boot with a
+`MemoryError`.
 
 ## Status LED
 

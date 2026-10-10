@@ -1,0 +1,198 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Settings - Pico Voltage Logger</title>
+<link rel="stylesheet" href="/ui.css">
+</head>
+<body data-page="settings" data-title="Settings">
+<main>
+<div id="groups"><div class="card"><div class="empty">Loading settings...</div></div></div>
+<div class="card savebar">
+  <span class="small" id="dirty">No unsaved changes.</span>
+  <div class="row">
+    <button class="btn" id="discardBtn" onclick="discard()" disabled>Discard</button>
+    <button class="btn" id="saveBtn" onclick="save(false)" disabled>Save</button>
+    <button class="btn primary" id="saveRestartBtn" onclick="save(true)" disabled>Save and restart</button>
+    <button class="btn" onclick="restartOnly()">Restart device</button>
+  </div>
+</div>
+</main>
+
+<script src="/ui.js"></script>
+<script>
+// [key, label, type, options]; a one-element entry starts a group.
+const F=[
+ ['Network'],
+ ['wifi_ssid','Wi-Fi network (SSID)','text',{}],
+ ['wifi_password','Wi-Fi password','password',{hint:'Leave blank to keep the current password.'}],
+ ['http_port','Web server port','int',{min:1,max:65535,warn:'After restarting, the page moves to the new port.'}],
+ ['Time'],
+ ['ntp_server','NTP server','text',{hint:'An IP address avoids DNS delays (needed with the watchdog on).'}],
+ ['ntp_resync_seconds','Clock resync interval','int',{min:60,unit:'s',dur:1}],
+ ['Logging'],
+ ['sample_interval_ms','Sample interval','int',{min:1,unit:'ms'}],
+ ['record_interval_ms','Record interval','records',{
+   hint:'Each record stores the average, minimum and maximum of the samples taken during the interval.',
+   warn:'Changing this erases stored history at restart.'}],
+ ['history_seconds','History length','records',{warn:'Changing this erases stored history at restart.'}],
+ ['Events'],
+ ['event_low_enabled','Low-voltage events','bool',{}],
+ ['event_low_voltage','Low-voltage threshold','float',{step:0.01,unit:'V',dep:'event_low_enabled'}],
+ ['event_excursion_enabled','Excursion events','bool',{
+   hint:'A record whose maximum minus minimum reaches the threshold.'}],
+ ['event_drop_volts','Excursion threshold','float',{min:0,step:0.01,unit:'V',dep:'event_excursion_enabled'}],
+ ['max_events','Events listed','int',{min:1,max:500}],
+ ['Display'],
+ ['max_table_rows','Measurement table rows','int',{min:10,max:500}],
+ ['max_graph_points','Chart points','int',{min:60,max:1440}],
+ ['Device'],
+ ['device_name','BLE device name','text',{maxlength:24}],
+ ['ble_enabled','BLE console','bool',{warn:'With BLE off there is no fallback if Wi-Fi fails.'}],
+ ['localecho','BLE command echo','bool',{}],
+ ['watchdog_enabled','Permanent watchdog','bool',{warn:'While on, USB/mpremote sessions are reset after about 8 s.'}]
+];
+const META={};F.forEach(f=>{if(f.length>1)META[f[0]]=f;});
+let original={};
+// The record interval and history sliders share one position, so the history
+// file always holds REC_COUNT records. recIdx<0: untouched, saved values shown.
+const REC_STEPS=[5,10,15,20,30,60,120,300], REC_COUNT=20000;
+let recIdx=-1;
+function longDur(s){return s>=172800?(s/86400).toFixed(1)+' days':
+  s>=3600?(s/3600).toFixed(s%3600?1:0)+' h':Math.round(s/60)+' min';}
+
+function dur(s){s=Number(s);if(!(s>0))return '';
+  return s>=3600?'= '+(s/3600).toFixed(s%3600?1:0)+' h':s>=60?'= '+(s/60).toFixed(s%60?1:0)+' min':'';}
+function esc(v){return String(v).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;');}
+
+function render(cfg){
+  let h='',open=false;
+  F.forEach(f=>{
+    if(f.length===1){if(open)h+='</div></div>';h+='<div class="card"><h2>'+f[0]+'</h2><div class="form">';open=true;return;}
+    const [k,label,type,o]=f, id='f_'+k;
+    let input;
+    if(type==='bool')input='<label class="switch"><input type="checkbox" id="'+id+'"'+(cfg[k]?' checked':'')+'> On</label>';
+    else if(type==='records')input='<input type="range" id="'+id+'" min="0" max="'+
+      (REC_STEPS.length-1)+'" step="1"><span class="rangeval" id="v_'+k+'"></span>'+
+      (k==='history_seconds'?'<div class="hint" id="recSummary"></div>':'');
+    else if(type==='password')input='<input type="password" id="'+id+'" autocomplete="new-password" placeholder="'+
+      (cfg.wifi_password_set?'unchanged':'not set')+'">';
+    else input='<input type="'+(type==='text'?'text':'number')+'" id="'+id+'" value="'+esc(cfg[k])+'"'+
+      (o.min!==undefined?' min="'+o.min+'"':'')+(o.max!==undefined?' max="'+o.max+'"':'')+
+      ' step="'+(o.step||(type==='float'?'any':1))+'"'+(o.maxlength?' maxlength="'+o.maxlength+'"':'')+'>'+
+      (o.unit?'<span class="unit">'+o.unit+'</span>':'')+(o.dur?'<span class="small" id="d_'+k+'"> '+dur(cfg[k])+'</span>':'');
+    h+='<label for="'+id+'">'+label+'</label><div class="field" id="r_'+k+'">'+input+
+      (o.hint?'<div class="hint">'+o.hint+'</div>':'')+(o.warn?'<div class="warn" hidden>⚠ '+o.warn+'</div>':'')+'</div>';
+  });
+  h+='</div></div>';
+  document.getElementById('groups').innerHTML=h;
+  document.querySelectorAll('#groups input').forEach(i=>i.addEventListener('input',update));
+  recIdx=-1;
+  const sec=cfg.record_interval_ms/1000;
+  let near=0;REC_STEPS.forEach((v,i)=>{if(Math.abs(v-sec)<Math.abs(REC_STEPS[near]-sec))near=i;});
+  document.querySelectorAll('input[type=range]').forEach(r=>{r.value=near;
+    r.addEventListener('input',function(){recIdx=Number(this.value);
+      document.querySelectorAll('input[type=range]').forEach(o=>o.value=recIdx);update();});});
+}
+
+function value(k){
+  const el=document.getElementById('f_'+k), t=META[k][2];
+  if(t==='bool')return el.checked;
+  if(t==='records'){if(recIdx<0)return original[k];
+    return k==='record_interval_ms'?REC_STEPS[recIdx]*1000:REC_STEPS[recIdx]*REC_COUNT;}
+  if(t==='int')return el.value===''?NaN:Math.round(Number(el.value));
+  if(t==='float')return el.value===''?NaN:Number(el.value);
+  return el.value;
+}
+
+function changes(){
+  const c={};
+  Object.keys(META).forEach(k=>{
+    const v=value(k);
+    if(META[k][2]==='password'){if(v!=='')c[k]=v;}
+    else if(v!==original[k])c[k]=v;
+  });
+  return c;
+}
+
+function update(){
+  const c=changes(), n=Object.keys(c).length;
+  Object.keys(META).forEach(k=>{
+    const row=document.getElementById('r_'+k), w=row.querySelector('.warn');
+    row.classList.toggle('changed',k in c);
+    if(w)w.hidden=!(k in c);
+    const d=document.getElementById('d_'+k); if(d)d.textContent=' '+dur(value(k));
+    const dep=META[k][3].dep; if(dep)document.getElementById('f_'+k).disabled=!value(dep);
+  });
+  const rs=value('record_interval_ms')/1000, hs=value('history_seconds'), n2=Math.floor(hs/rs);
+  document.getElementById('v_record_interval_ms').textContent=rs>=60?(rs/60)+' min':rs+' s';
+  document.getElementById('v_history_seconds').textContent=longDur(hs);
+  document.getElementById('recSummary').textContent=n2.toLocaleString('en-GB')+' records ('+
+    Math.round(n2*12/1000)+' KB of flash).'+(n2<REC_COUNT?' Moving either slider sets '+
+    REC_COUNT.toLocaleString('en-GB')+'.':'');
+  document.getElementById('dirty').textContent=n?n+' unsaved change'+(n>1?'s':'')+'.':'No unsaved changes.';
+  ['discardBtn','saveBtn','saveRestartBtn'].forEach(id=>document.getElementById(id).disabled=!n);
+}
+
+async function load(){
+  try{
+    const r=await fetch('/api/config',{cache:'no-store'});
+    if(!r.ok)throw new Error('HTTP '+r.status);
+    original=await r.json();
+    render(original);update();
+  }catch(e){document.getElementById('groups').innerHTML=
+    '<div class="card"><div class="empty">Could not load settings: '+e.message+'</div></div>';}
+}
+
+function discard(){render(original);update();}
+
+async function save(restart){
+  const c=changes();
+  for(const k in c){
+    const t=META[k][2];
+    if((t==='int'||t==='float')&&!isFinite(c[k])){ui.toast(META[k][1]+' needs a number');return;}
+  }
+  const warns=Object.keys(c).filter(k=>META[k][3].warn).map(k=>'• '+META[k][1]+': '+META[k][3].warn);
+  const msg=(restart?'Save and restart the logger?':'Save these settings? They take effect at the next restart.')+
+    (warns.length?'\n\n'+warns.join('\n'):'');
+  if(!confirm(msg))return;
+  if(restart)c._restart=true;
+  try{
+    const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(c)});
+    const d=await r.json();
+    if(!d.ok)throw new Error(d.error||('HTTP '+r.status));
+    if(d.adjusted.length)ui.toast('Saved. Adjusted to valid values: '+d.adjusted.map(k=>META[k]?META[k][1]:k).join(', '));
+    else ui.toast(restart?'Saved; restarting...':'Saved. Restart to apply.');
+    if(restart)waitForRestart(c.http_port||null);
+    else load();
+  }catch(e){ui.toast('Save failed: '+e.message);}
+}
+
+async function restartOnly(){
+  if(!confirm('Restart the logger now? It is unavailable for about 20 seconds.'))return;
+  try{await fetch('/api/restart',{method:'POST'});ui.toast('Restarting...');waitForRestart(null);}
+  catch(e){ui.toast('Restart failed: '+e.message);}
+}
+
+function waitForRestart(newPort){
+  document.querySelectorAll('.savebar button').forEach(b=>b.disabled=true);
+  const dirty=document.getElementById('dirty');
+  if(newPort&&String(newPort)!==(location.port||'80')){
+    const url=location.protocol+'//'+location.hostname+(newPort==80?'':':'+newPort)+'/settings';
+    dirty.innerHTML='Restarting. The logger will be at <a href="'+url+'">'+url+'</a>.';
+    return;
+  }
+  dirty.textContent='Restarting... waiting for the logger to come back.';
+  const start=Date.now();
+  setTimeout(function poll(){
+    fetch('/api/live',{cache:'no-store'}).then(r=>{if(r.ok)location.reload();else throw 0;})
+      .catch(()=>{if(Date.now()-start<120000)setTimeout(poll,3000);
+        else dirty.textContent='The logger has not come back after 2 minutes. Check it over BLE.';});
+  },6000);
+}
+
+load();
+</script>
+</body>
+</html>
